@@ -13,6 +13,10 @@ dynamic = ["dependencies"]
 [project.scripts]
 shortsmaker-mcp = "shortsmaker_mcp.cli:main"
 
+[tool.vercel]
+# Vercel resolves this file before installing the package from src/.
+entrypoint = "app:app"
+
 [tool.setuptools.dynamic]
 # requirements.txt is the single source of pinned runtime dependencies.
 dependencies = { file = ["requirements.txt"] }

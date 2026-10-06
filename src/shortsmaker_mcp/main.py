@@ -10,7 +10,7 @@ from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Mount, Route, Router
 from starlette.types import ASGIApp
 
 from .backend_client import BackendClient
@@ -39,7 +39,7 @@ register_tools(server, backend)
 _DASHBOARD_PATH = Path(__file__).with_name("static") / "dashboard.html"
 
 
-def _transport_security(settings: Settings = settings) -> TransportSecuritySettings:
+def _transport_security(settings: Settings) -> TransportSecuritySettings:
     # Only this service's own public hostname is a valid Host/Origin; the backend's is not.
     hosts = ["localhost:*", "127.0.0.1:*", "[::1]:*"]
     origins = ["http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"]
@@ -59,7 +59,7 @@ def _dashboard(request):
 def _health_live(request):
     return JSONResponse({"status": "ok", "service": "shortsmaker-mcp", "version": server.version})
 
-##the client follows the url URL from the 401 and recieves JSON containig the exact MCP URL , the backends Oauth issues and the supported mcp:read and mcp:write
+
 def _protected_resource_metadata(request):
     if not settings.resource_url or not settings.oauth_issuer:
         return JSONResponse({"detail": "MCP OAuth is not configured."}, status_code=503)
@@ -73,41 +73,52 @@ def _protected_resource_metadata(request):
     )
 
 
-@asynccontextmanager
-async def _lifespan(app):
-    """Own the MCP session manager because the protocol app is mounted below this app."""
-    async with server.session_manager.run():
-        try:
-            yield
-        finally:
-            await backend.aclose()
-            await token_validator.aclose()
-
-## MCP protocol app wrapped with the BearerValidationMiddleware so every request is verifed 
 def create_app() -> ASGIApp:
     """Build the protected MCP endpoint and local testing dashboard."""
     protocol_app = server.streamable_http_app(
         streamable_http_path="/",
         json_response=True,
-        transport_security=_transport_security(),
+        # Requests may reach different Vercel instances. Each carries its own OAuth token.
+        stateless_http=True,
+        transport_security=_transport_security(settings),
     )
+    manager = server.session_manager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # Mounted apps do not run their own lifespan; own this app's manager explicitly.
+        try:
+            async with manager.run():
+                yield
+        finally:
+            await backend.aclose()
+            await token_validator.aclose()
+
     protected_mcp = BearerValidationMiddleware(
-        protocol_app,
+        # JSON requests finish within one function invocation. Do not open an idle GET/SSE
+        # stream on Vercel. Authenticate first so an initial GET still receives OAuth discovery.
+        Router(routes=[Route("/", endpoint=protocol_app, methods=["POST"])]),
         token_validator,
         settings,
         RequestRateLimiter(settings.rate_limit_requests, settings.rate_limit_window_seconds),
     )
     routes = [
         Route("/health/live", _health_live, methods=["GET"]),
-        Route("/.well-known/oauth-protected-resource", _protected_resource_metadata, methods=["GET"]),
-        Route("/.well-known/oauth-protected-resource/mcp", _protected_resource_metadata, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-protected-resource", _protected_resource_metadata, methods=["GET"]
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            _protected_resource_metadata,
+            methods=["GET"],
+        ),
         Mount("/mcp", app=protected_mcp),
     ]
     if settings.dashboard_enabled:
         routes[3:3] = [Route("/dashboard", _dashboard), Route("/dashboard/", _dashboard)]
     return Starlette(
         routes=routes,
-        lifespan=_lifespan,
+        lifespan=lifespan,
     )
 
 

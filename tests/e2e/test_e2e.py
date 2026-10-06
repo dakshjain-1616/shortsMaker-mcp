@@ -43,14 +43,14 @@ TEST_JWK.update({"kid": "e2e-key", "alg": "RS256", "use": "sig"})
 BRIDGE_SECRET = "e2e-bridge-secret-with-at-least-32-chars"
 
 
-def oauth_token(stack, label="good-token", base="mcp"):
+def oauth_token(stack, label="good-token", base="mcp", *, scope="mcp:read mcp:write"):
     users = {"good-token": "user-a", "other-token": "user-b", "cache-token": "user-a", "outage-token": "user-a"}
     if label not in users:
         return label
     now = int(time.time())
     return jwt.encode(
         {"iss": stack["backend"], "sub": users[label], "aud": f"{stack[base]}/mcp/",
-         "client_id": "e2e", "scope": "mcp:read mcp:write", "token_use": "mcp_access",
+         "client_id": "e2e", "scope": scope, "token_use": "mcp_access",
          "iat": now, "exp": now + 600},
         TEST_KEY, algorithm="RS256", headers={"kid": "e2e-key"},
     )
@@ -89,14 +89,19 @@ def _mcp_env(backend_url: str, resource_url: str, **extra: str) -> dict[str, str
 
 @pytest.fixture(scope="module")
 def stack():
-    backend_port, mcp_port, limited_port = _free_port(), _free_port(), _free_port()
+    backend_port, mcp_port, limited_port, replica_port = (_free_port() for _ in range(4))
     backend_url = f"http://127.0.0.1:{backend_port}"
     procs = [
         _start(["tests.e2e.mock_backend:app"], {"PYTHONPATH": str(ROOT),
             "MCP_BRIDGE_SECRET": BRIDGE_SECRET, "MCP_TEST_PUBLIC_JWK": json.dumps(TEST_JWK)}, backend_port),
         _start(["shortsmaker_mcp.main:app", "--app-dir", "src"],
-            _mcp_env(backend_url, f"http://127.0.0.1:{mcp_port}/mcp/", MCP_RATE_LIMIT_REQUESTS="100000"),
+            _mcp_env(backend_url, f"http://127.0.0.1:{mcp_port}/mcp/", MCP_RATE_LIMIT_REQUESTS="100000", MCP_DASHBOARD_ENABLED="true"),
             mcp_port,
+        ),
+        # Separate process, same canonical resource: models a fresh Vercel instance.
+        _start(["app:app"],
+            _mcp_env(backend_url, f"http://127.0.0.1:{mcp_port}/mcp/", MCP_RATE_LIMIT_REQUESTS="100000"),
+            replica_port,
         ),
         _start(
             ["shortsmaker_mcp.main:app", "--app-dir", "src"],
@@ -110,6 +115,7 @@ def stack():
         "backend": backend_url,
         "mcp": f"http://127.0.0.1:{mcp_port}",
         "limited": f"http://127.0.0.1:{limited_port}",
+        "replica": f"http://127.0.0.1:{replica_port}",
         "procs": procs,
     }
     for proc in procs:
@@ -164,6 +170,47 @@ def test_tool_and_prompt_catalogue(stack):
         assert tool.output_schema is not None, tool.name
         if not tool.annotations.read_only_hint:
             assert "confirm" in tool.input_schema["properties"], tool.name
+
+
+def test_initialize_and_tools_work_across_separate_instances(stack):
+    headers = {**MCP_HEADERS, "Authorization": f"Bearer {oauth_token(stack)}"}
+    initialized = httpx.post(f"{stack['mcp']}/mcp/", headers=headers, json=INIT)
+    assert initialized.status_code == 200
+    assert "mcp-session-id" not in initialized.headers
+    headers["MCP-Protocol-Version"] = initialized.json()["result"]["protocolVersion"]
+    # This instance has never received initialize and has no shared process memory.
+    listed = httpx.post(f"{stack['replica']}/mcp/", headers=headers,
+                       json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert listed.status_code == 200 and len(listed.json()["result"]["tools"]) == 29
+    assert "mcp-session-id" not in listed.headers
+    called = httpx.post(f"{stack['replica']}/mcp/", headers=headers, json={
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "shortsmaker_get_credit_status", "arguments": {}}})
+    assert called.status_code == 200
+    assert called.json()["result"]["structuredContent"] == {"balance": 100}
+    assert httpx.get(f"{stack['replica']}/dashboard").status_code == 404
+
+
+def test_stateless_requests_use_each_tokens_identity_and_scopes(stack):
+    for instance, label, expected_balance in (
+        ("mcp", "good-token", 100), ("replica", "other-token", 5), ("mcp", "other-token", 5),
+    ):
+        response = httpx.post(f"{stack[instance]}/mcp/", headers={
+            **MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25",
+            "Authorization": f"Bearer {oauth_token(stack, label)}"}, json={
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "shortsmaker_get_credit_status", "arguments": {}}})
+        assert response.status_code == 200
+        assert response.json()["result"]["structuredContent"] == {"balance": expected_balance}
+    assert [entry["user"] for entry in backend_calls(stack)] == ["user-a", "user-b", "user-b"]
+    # A previous write grant cannot survive into the next request's read-only grant.
+    response = httpx.post(f"{stack['mcp']}/mcp/", headers={
+        **MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25",
+        "Authorization": f"Bearer {oauth_token(stack, scope='mcp:read')}"}, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "shortsmaker_pause_workflow", "arguments": {"workflow_id": UUID0, "confirm": True}}})
+    assert response.status_code == 200 and response.json()["result"]["isError"] is True
+    assert len(backend_calls(stack)) == 3
 
 
 def test_prompts_render_and_reject_bad_arguments(stack):
@@ -481,9 +528,13 @@ def test_malformed_and_oversized_bodies_do_not_crash_the_service(stack):
 
 
 def test_get_without_session_and_wrong_methods(stack):
+    missing = httpx.get(f"{stack['mcp']}/mcp/")
+    assert missing.status_code == 401 and "www-authenticate" in missing.headers
     signed = {"Authorization": f"Bearer {oauth_token(stack)}"}
-    assert httpx.get(f"{stack['mcp']}/mcp/", headers=signed).status_code in {400, 405, 406}
-    assert httpx.put(f"{stack['mcp']}/mcp/", headers=signed).status_code in {405, 400}
+    for method in ("GET", "DELETE", "PUT"):
+        response = httpx.request(method, f"{stack['mcp']}/mcp/", headers=signed)
+        assert response.status_code == 405
+        assert response.headers["allow"] == "POST"
 
 
 def test_rebinding_protection_rejects_foreign_host_and_origin(stack):
