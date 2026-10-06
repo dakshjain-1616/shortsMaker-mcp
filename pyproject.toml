@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shortsmaker-mcp"
+version = "0.2.0"
+description = "Streamable HTTP MCP server for ShortsMaker video generation and publishing."
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+shortsmaker-mcp = "shortsmaker_mcp.cli:main"
+
+[tool.setuptools.dynamic]
+# requirements.txt is the single source of pinned runtime dependencies.
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+shortsmaker_mcp = ["static/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+# Line length is a formatting concern; tool signatures keep schema descriptions inline.
+ignore = ["E501"]

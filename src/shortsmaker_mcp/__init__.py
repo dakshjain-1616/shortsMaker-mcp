@@ -1,0 +1,2 @@
+"""Standalone ShortsMaker MCP service."""
+

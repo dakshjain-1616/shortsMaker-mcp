@@ -1,0 +1,12 @@
+# Local/staging run:  cp .env.example .env  &&  docker compose up -d --build
+services:
+  mcp:
+    build: .
+    image: shortsmaker-mcp:0.2.0
+    env_file: .env
+    environment:
+      # Must listen on all interfaces inside the container; the port is published to localhost only.
+      MCP_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8002:8002"
+    restart: unless-stopped

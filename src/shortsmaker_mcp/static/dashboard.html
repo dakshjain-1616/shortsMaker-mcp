@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ShortsMaker MCP Tester</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f5f7fb;
+        color: #172033;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; }
+      main { width: min(920px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
+      .card { background: #fff; border: 1px solid #dfe4ee; border-radius: 16px; padding: 24px; box-shadow: 0 10px 30px rgba(26, 39, 68, .07); }
+      .card + .card { margin-top: 18px; }
+      h1 { margin: 0 0 8px; font-size: clamp(1.8rem, 4vw, 2.5rem); }
+      h2 { margin: 0 0 14px; font-size: 1.15rem; }
+      p { color: #58647a; line-height: 1.5; }
+      code { background: #eef1f7; border-radius: 5px; padding: 2px 5px; }
+      label { display: block; margin: 18px 0 7px; font-weight: 650; }
+      input, textarea, select { width: 100%; border: 1px solid #bdc7d8; border-radius: 9px; padding: 12px 13px; font: inherit; }
+      input[type="checkbox"] { width: auto; padding: 0; }
+      input:focus { outline: 3px solid rgba(47, 102, 246, .16); border-color: #2f66f6; }
+      .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+      button { border: 0; border-radius: 9px; padding: 11px 16px; font: inherit; font-weight: 700; cursor: pointer; }
+      button.primary { background: #2f66f6; color: #fff; }
+      button.secondary { background: #e9eef8; color: #263653; }
+      button.danger { background: #fff0f0; color: #b42318; }
+      button:disabled { opacity: .55; cursor: wait; }
+      .status { min-height: 24px; color: #58647a; }
+      .status.error { color: #b42318; }
+      .status.success { color: #177245; }
+      pre { margin: 0; min-height: 190px; max-height: 520px; overflow: auto; background: #111827; color: #d9e2f2; border-radius: 10px; padding: 16px; white-space: pre-wrap; word-break: break-word; }
+      .warning { font-size: .9rem; color: #7a5b00; background: #fff8dd; border: 1px solid #f2df91; border-radius: 9px; padding: 10px 12px; }
+      .endpoint { font-size: .9rem; color: #58647a; }
+      .danger-zone { border-color: #f0c5c5; }
+      .confirm { display: flex; gap: 8px; align-items: flex-start; font-weight: 500; }
+      .confirm input { margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <h1>ShortsMaker MCP tester</h1>
+        <p>Use this local dashboard to test the real MCP endpoint against the staging backend.</p>
+        <p class="endpoint">MCP endpoint: <code id="endpoint"></code></p>
+        <div class="warning">The access token is stored in this browser's local storage. Use this only on your private local machine.</div>
+
+        <label for="token">ShortsMaker staging access token</label>
+        <input id="token" type="password" autocomplete="off" placeholder="Paste access_token from Swagger sign-in" />
+        <div class="row" style="margin-top: 12px">
+          <button class="secondary" id="save">Save token locally</button>
+          <button class="danger" id="clear">Clear saved token</button>
+          <button class="secondary" id="toggle">Show token</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Preview video price</h2>
+        <p>This calls the backend pricing endpoint only. It does not create a job or spend credits.</p>
+        <label for="price-niche">Topic or niche (optional)</label>
+        <input id="price-niche" type="text" maxlength="10000" placeholder="Example: unusual facts about deep-sea animals" />
+        <label for="price-length">Total length in seconds</label>
+        <input id="price-length" type="number" min="1" max="3600" step="1" value="15" />
+        <label for="price-mode">Mode</label>
+        <input id="price-mode" type="text" maxlength="32" value="lite" />
+        <label for="price-format">Format</label>
+        <input id="price-format" type="text" maxlength="64" value="transformation" />
+        <label for="price-resolution">Resolution</label>
+        <input id="price-resolution" type="text" maxlength="32" value="720p" />
+        <label for="price-audio">Audio mode (optional)</label>
+        <input id="price-audio" type="text" maxlength="32" placeholder="Leave blank for backend default" />
+        <label for="price-workflow">Workflow (optional)</label>
+        <input id="price-workflow" type="text" maxlength="64" placeholder="Leave blank unless required" />
+        <div class="row" style="margin-top: 16px">
+          <button class="primary" id="price">Preview price</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Read-only tools</h2>
+        <div class="row">
+          <button class="primary" id="credits">Get credits</button>
+          <button class="secondary" id="subscription">Subscription</button>
+          <button class="secondary" id="plans">Plans</button>
+          <button class="secondary" id="features">Account features</button>
+          <button class="secondary" id="options">Video options</button>
+          <button class="secondary" id="videos">List videos</button>
+          <button class="secondary" id="connections">List connections</button>
+          <button class="secondary" id="posts">List posts</button>
+          <button class="secondary" id="health">Publishing health</button>
+        </div>
+        <label for="job-id">Job ID for detailed video status</label>
+        <div class="row">
+          <input id="job-id" type="text" autocomplete="off" placeholder="Paste a job UUID from List videos" />
+        <button class="secondary" id="video">Get video</button>
+        </div>
+        <h3>Recurring workflow readers</h3>
+        <div class="row">
+          <button class="secondary" id="workflows">List workflows</button>
+        </div>
+        <label for="workflow-id">Workflow UUID</label>
+        <div class="row">
+          <input id="workflow-id" type="text" autocomplete="off" placeholder="Paste a workflow UUID" />
+          <button class="secondary" id="workflow">Get workflow</button>
+          <button class="secondary" id="workflow-slots">List slots</button>
+        </div>
+        <p id="status" class="status" aria-live="polite"></p>
+        <pre id="output">Click “Get credits” to call shortsmaker_get_credit_status.</pre>
+      </section>
+
+      <section class="card danger-zone">
+        <h2>Write tools — staging only</h2>
+        <p class="warning">These actions can spend credits, change metadata, disconnect accounts, or queue real social posts. Review the exact action first. Every button below requires its own confirmation checkbox.</p>
+
+        <h3>Create and queue a video</h3>
+        <label for="create-niche">Topic or niche</label>
+        <input id="create-niche" type="text" maxlength="10000" placeholder="Example: unusual facts about deep-sea animals" />
+        <label for="create-length">Total length in seconds</label>
+        <input id="create-length" type="number" min="1" max="3600" step="1" value="15" />
+        <label for="create-idempotency">Idempotency key</label>
+        <input id="create-idempotency" type="text" maxlength="200" autocomplete="off" />
+        <label class="confirm"><input id="create-confirm" type="checkbox" /> I reviewed the settings and approve creating this staging job and holding its quoted credits.</label>
+        <button class="danger" id="create-video">Create video</button>
+
+        <h3>Control a video job</h3>
+        <label for="control-job-id">Job UUID</label>
+        <input id="control-job-id" type="text" autocomplete="off" placeholder="Paste a job UUID" />
+        <label for="control-action">Action</label>
+        <select id="control-action"><option value="cancel">Cancel</option><option value="pause">Pause</option><option value="retry">Retry</option></select>
+        <label class="confirm"><input id="control-confirm" type="checkbox" /> I understand the selected job action and approve it.</label>
+        <button class="danger" id="control-video">Control video</button>
+
+        <h3>Update video metadata</h3>
+        <label for="metadata-job-id">Job UUID</label>
+        <input id="metadata-job-id" type="text" autocomplete="off" placeholder="Paste a job UUID" />
+        <label for="metadata-title">Title (optional)</label>
+        <input id="metadata-title" type="text" maxlength="500" />
+        <label for="metadata-description">Description (optional)</label>
+        <textarea id="metadata-description" maxlength="10000" rows="3"></textarea>
+        <label for="metadata-tags">Tags, comma-separated (optional)</label>
+        <input id="metadata-tags" type="text" maxlength="5000" />
+        <label for="metadata-visibility">Visibility (optional)</label>
+        <select id="metadata-visibility"><option value="">Leave unchanged</option><option value="public">Public</option><option value="unlisted">Unlisted</option><option value="private">Private</option></select>
+        <label class="confirm"><input id="metadata-confirm" type="checkbox" /> I approve updating this video's metadata, including any published YouTube metadata.</label>
+        <button class="danger" id="update-metadata">Update metadata</button>
+
+        <h3>Start or disconnect a social account</h3>
+        <label for="connection-platform">Provider</label>
+        <select id="connection-platform"><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="tiktok">TikTok</option></select>
+        <label class="confirm"><input id="connection-confirm" type="checkbox" /> I approve starting the browser authorization flow for this provider.</label>
+        <button class="danger" id="start-connection">Start connection</button>
+        <label for="disconnect-id">Connection UUID</label>
+        <input id="disconnect-id" type="text" autocomplete="off" placeholder="Paste a connection UUID" />
+        <label class="confirm"><input id="disconnect-confirm" type="checkbox" /> I approve disconnecting this account and canceling its queued posts.</label>
+        <button class="danger" id="disconnect">Disconnect account</button>
+
+        <h3>Queue a video for publishing</h3>
+        <label for="publish-job-id">Completed job UUID</label>
+        <input id="publish-job-id" type="text" autocomplete="off" placeholder="Paste a completed job UUID" />
+        <label for="publish-connections">Connection UUIDs, comma-separated</label>
+        <input id="publish-connections" type="text" autocomplete="off" placeholder="connection-uuid-1, connection-uuid-2" />
+        <label for="publish-schedule">Schedule (optional, local time converted to UTC)</label>
+        <input id="publish-schedule" type="datetime-local" />
+        <label for="publish-title">Title (optional)</label>
+        <input id="publish-title" type="text" maxlength="500" />
+        <label for="publish-description">Description (optional)</label>
+        <textarea id="publish-description" maxlength="10000" rows="3"></textarea>
+        <label for="publish-tags">Tags, comma-separated (optional)</label>
+        <input id="publish-tags" type="text" maxlength="5000" />
+        <label for="publish-visibility">Visibility</label>
+        <select id="publish-visibility"><option value="public">Public</option><option value="unlisted">Unlisted</option><option value="private">Private</option></select>
+        <label class="confirm"><input id="publish-confirm" type="checkbox" /> I reviewed the accounts, content, visibility, and schedule and approve queueing this post.</label>
+        <button class="danger" id="publish-video">Queue publish</button>
+
+        <h3>Control a publishing post</h3>
+        <label for="post-id">Post UUID</label>
+        <input id="post-id" type="text" autocomplete="off" placeholder="Paste a post UUID" />
+        <label for="post-action">Action</label>
+        <select id="post-action"><option value="cancel">Cancel</option><option value="retry">Retry</option></select>
+        <label class="confirm"><input id="post-confirm" type="checkbox" /> I understand the selected post action and approve it.</label>
+        <button class="danger" id="control-post">Control post</button>
+      </section>
+    </main>
+
+    <script>
+      const TOKEN_KEY = "shortsmaker.mcp.access_token";
+      const MCP_ENDPOINT = `${window.location.origin}/mcp/`;
+      const tokenInput = document.getElementById("token");
+      const status = document.getElementById("status");
+      const output = document.getElementById("output");
+      const actionButtons = [...document.querySelectorAll("button")];
+      let sessionId = null;
+
+      document.getElementById("endpoint").textContent = MCP_ENDPOINT;
+      tokenInput.value = window.localStorage.getItem(TOKEN_KEY) || "";
+      document.getElementById("create-idempotency").value = newIdempotencyKey();
+
+      function newIdempotencyKey() {
+        return window.crypto?.randomUUID?.() || `mcp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      }
+
+      function inputValue(id) {
+        return document.getElementById(id).value.trim();
+      }
+
+      function requiredValue(id, label) {
+        const value = inputValue(id);
+        if (!value) throw new Error(`${label} is required.`);
+        return value;
+      }
+
+      function checked(id) {
+        return document.getElementById(id).checked;
+      }
+
+      function csvValues(id) {
+        return inputValue(id).split(",").map((value) => value.trim()).filter(Boolean);
+      }
+
+      function localDateTimeToIso(id) {
+        const value = inputValue(id);
+        return value ? new Date(value).toISOString() : undefined;
+      }
+
+      function setStatus(message, kind = "") {
+        status.textContent = message;
+        status.className = `status ${kind}`;
+      }
+
+      function show(value) {
+        output.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      }
+
+      function token() {
+        const value = tokenInput.value.trim();
+        if (!value) throw new Error("Enter a staging access token first.");
+        return value;
+      }
+
+      async function rpc(method, params, id) {
+        const headers = {
+          "Authorization": `Bearer ${token()}`,
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/event-stream",
+        };
+        if (sessionId) headers["Mcp-Session-Id"] = sessionId;
+
+        const response = await fetch(MCP_ENDPOINT, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        });
+        const responseSession = response.headers.get("mcp-session-id");
+        if (responseSession) sessionId = responseSession;
+
+        const text = await response.text();
+        let body;
+        try { body = text ? JSON.parse(text) : null; }
+        catch { body = { raw: text }; }
+        if (!response.ok) {
+          throw new Error(body?.detail || body?.error?.message || `MCP request failed (${response.status})`);
+        }
+        if (body?.error) throw new Error(body.error.message || "MCP tool call failed");
+        return body?.result ?? body;
+      }
+
+      async function initializeSession() {
+        sessionId = null;
+        return rpc("initialize", {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "shortsmaker-local-dashboard", version: "1.0" },
+        }, 1);
+      }
+
+      function displayToolResult(result) {
+        const text = result?.content?.find((item) => item.type === "text")?.text;
+        if (text) {
+          try { show(JSON.parse(text)); }
+          catch { show(text); }
+        } else {
+          show(result);
+        }
+      }
+
+      async function callTool(name, argumentsValue, successMessage) {
+        if (!sessionId) await initializeSession();
+        const result = await rpc("tools/call", {
+          name,
+          arguments: argumentsValue,
+        }, 2);
+        displayToolResult(result);
+        setStatus(successMessage, "success");
+      }
+
+      async function runAction(action) {
+        actionButtons.forEach((button) => { button.disabled = true; });
+        setStatus("Calling MCP…");
+        try {
+          await action();
+        } catch (error) {
+          setStatus(error.message || String(error), "error");
+          show({ error: error.message || String(error) });
+        } finally {
+          actionButtons.forEach((button) => { button.disabled = false; });
+        }
+      }
+
+      document.getElementById("save").onclick = () => {
+        const value = tokenInput.value.trim();
+        if (!value) return setStatus("Enter a token before saving.", "error");
+        window.localStorage.setItem(TOKEN_KEY, value);
+        setStatus("Token saved in this browser.", "success");
+      };
+      document.getElementById("clear").onclick = () => {
+        window.localStorage.removeItem(TOKEN_KEY);
+        tokenInput.value = "";
+        setStatus("Saved token cleared.", "success");
+      };
+      document.getElementById("toggle").onclick = (event) => {
+        const visible = tokenInput.type === "text";
+        tokenInput.type = visible ? "password" : "text";
+        event.currentTarget.textContent = visible ? "Show token" : "Hide token";
+      };
+      document.getElementById("price").onclick = () => runAction(() => {
+        const lengthValue = Number(document.getElementById("price-length").value);
+        if (!Number.isInteger(lengthValue) || lengthValue < 1 || lengthValue > 3600) {
+          throw new Error("Total length must be an integer between 1 and 3600 seconds.");
+        }
+        const mode = inputValue("price-mode");
+        const format = inputValue("price-format");
+        const resolution = inputValue("price-resolution");
+        if (!mode || !format || !resolution) {
+          throw new Error("Mode, format, and resolution are required.");
+        }
+        const argumentsValue = {
+          total_length: lengthValue,
+          mode,
+          format,
+          resolution,
+        };
+        for (const [key, id] of [["niche", "price-niche"], ["audio_mode", "price-audio"], ["workflow", "price-workflow"]]) {
+          const optional = inputValue(id);
+          if (optional) argumentsValue[key] = optional;
+        }
+        return callTool("shortsmaker_resolve_video_price", argumentsValue, "Video price loaded through MCP.");
+      });
+      document.getElementById("credits").onclick = () => runAction(
+        () => callTool("shortsmaker_get_credit_status", {}, "Credit status loaded through MCP.")
+      );
+      document.getElementById("subscription").onclick = () => runAction(
+        () => callTool("shortsmaker_get_subscription", {}, "Subscription status loaded through MCP.")
+      );
+      document.getElementById("plans").onclick = () => runAction(
+        () => callTool("shortsmaker_list_subscription_plans", {}, "Subscription plans loaded through MCP.")
+      );
+      document.getElementById("features").onclick = () => runAction(
+        () => callTool("shortsmaker_get_account_features", {}, "Account features loaded through MCP.")
+      );
+      document.getElementById("options").onclick = () => runAction(
+        () => callTool("shortsmaker_get_video_options", {}, "Video options loaded through MCP.")
+      );
+      document.getElementById("videos").onclick = () => runAction(
+        () => callTool("shortsmaker_list_videos", {}, "Videos loaded through MCP.")
+      );
+      document.getElementById("connections").onclick = () => runAction(
+        () => callTool("shortsmaker_list_connections", {}, "Connected accounts loaded through MCP.")
+      );
+      document.getElementById("posts").onclick = () => runAction(
+        () => callTool("shortsmaker_list_posts", {}, "Posts loaded through MCP.")
+      );
+      document.getElementById("health").onclick = () => runAction(
+        () => callTool("shortsmaker_publishing_health", {}, "Publishing health loaded through MCP.")
+      );
+      document.getElementById("video").onclick = () => runAction(() => {
+        const jobId = document.getElementById("job-id").value.trim();
+        if (!jobId) throw new Error("Enter a job UUID first.");
+        return callTool("shortsmaker_get_video", { job_id: jobId }, "Video status loaded through MCP.");
+      });
+      document.getElementById("workflows").onclick = () => runAction(
+        () => callTool("shortsmaker_list_workflows", {}, "Workflows loaded through MCP.")
+      );
+      document.getElementById("workflow").onclick = () => runAction(() => {
+        return callTool("shortsmaker_get_workflow", {
+          workflow_id: requiredValue("workflow-id", "Workflow UUID"),
+        }, "Workflow loaded through MCP.");
+      });
+      document.getElementById("workflow-slots").onclick = () => runAction(() => {
+        return callTool("shortsmaker_list_workflow_slots", {
+          workflow_id: requiredValue("workflow-id", "Workflow UUID"),
+        }, "Workflow slots loaded through MCP.");
+      });
+
+      document.getElementById("create-video").onclick = () => runAction(() => {
+        const lengthValue = Number(document.getElementById("create-length").value);
+        if (!Number.isInteger(lengthValue) || lengthValue < 1 || lengthValue > 3600) {
+          throw new Error("Total length must be an integer between 1 and 3600 seconds.");
+        }
+        if (!checked("create-confirm")) throw new Error("Check the creation confirmation first.");
+        const argumentsValue = {
+          niche: requiredValue("create-niche", "Topic or niche"),
+          total_length: lengthValue,
+          idempotency_key: requiredValue("create-idempotency", "Idempotency key"),
+          confirm: true,
+        };
+        return callTool("shortsmaker_create_video", argumentsValue, "Video job submitted to staging.")
+          .then(() => { document.getElementById("create-idempotency").value = newIdempotencyKey(); });
+      });
+
+      document.getElementById("control-video").onclick = () => runAction(() => {
+        if (!checked("control-confirm")) throw new Error("Check the video-action confirmation first.");
+        return callTool("shortsmaker_control_video", {
+          job_id: requiredValue("control-job-id", "Job UUID"),
+          action: document.getElementById("control-action").value,
+          confirm: true,
+        }, "Video action submitted to staging.");
+      });
+
+      document.getElementById("update-metadata").onclick = () => runAction(() => {
+        if (!checked("metadata-confirm")) throw new Error("Check the metadata confirmation first.");
+        const argumentsValue = { job_id: requiredValue("metadata-job-id", "Job UUID"), confirm: true };
+        for (const [key, id] of [["title", "metadata-title"], ["description", "metadata-description"]]) {
+          const value = inputValue(id);
+          if (value) argumentsValue[key] = value;
+        }
+        const tags = csvValues("metadata-tags");
+        if (tags.length) argumentsValue.tags = tags;
+        const visibility = document.getElementById("metadata-visibility").value;
+        if (visibility) argumentsValue.visibility = visibility;
+        if (Object.keys(argumentsValue).length === 2) throw new Error("Provide at least one metadata field.");
+        return callTool("shortsmaker_update_video_metadata", argumentsValue, "Video metadata updated through MCP.");
+      });
+
+      document.getElementById("start-connection").onclick = () => runAction(() => {
+        if (!checked("connection-confirm")) throw new Error("Check the connection confirmation first.");
+        return callTool("shortsmaker_start_connection", {
+          platform: document.getElementById("connection-platform").value,
+          confirm: true,
+        }, "Authorization URL created. Open it from the output to continue.");
+      });
+
+      document.getElementById("disconnect").onclick = () => runAction(() => {
+        if (!checked("disconnect-confirm")) throw new Error("Check the disconnect confirmation first.");
+        return callTool("shortsmaker_disconnect", {
+          connection_id: requiredValue("disconnect-id", "Connection UUID"),
+          confirm: true,
+        }, "Social account disconnect submitted to staging.");
+      });
+
+      document.getElementById("publish-video").onclick = () => runAction(() => {
+        if (!checked("publish-confirm")) throw new Error("Check the publishing confirmation first.");
+        const connectionIds = csvValues("publish-connections");
+        if (!connectionIds.length) throw new Error("At least one connection UUID is required.");
+        const argumentsValue = {
+          job_id: requiredValue("publish-job-id", "Completed job UUID"),
+          connection_ids: connectionIds,
+          visibility: document.getElementById("publish-visibility").value,
+          confirm: true,
+        };
+        const scheduledAt = localDateTimeToIso("publish-schedule");
+        if (scheduledAt) argumentsValue.scheduled_at = scheduledAt;
+        for (const [key, id] of [["title", "publish-title"], ["description", "publish-description"]]) {
+          const value = inputValue(id);
+          if (value) argumentsValue[key] = value;
+        }
+        const tags = csvValues("publish-tags");
+        if (tags.length) argumentsValue.tags = tags;
+        return callTool("shortsmaker_publish_video", argumentsValue, "Post queued through MCP; check post status for completion.");
+      });
+
+      document.getElementById("control-post").onclick = () => runAction(() => {
+        if (!checked("post-confirm")) throw new Error("Check the post-action confirmation first.");
+        return callTool("shortsmaker_control_post", {
+          post_id: requiredValue("post-id", "Post UUID"),
+          action: document.getElementById("post-action").value,
+          confirm: true,
+        }, "Publishing post action submitted to staging.");
+      });
+    </script>
+  </body>
+</html>

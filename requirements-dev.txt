@@ -1,0 +1,6 @@
+-e .
+-r requirements.txt
+
+pytest==9.1.1
+ruff==0.16.0
+httpx2==2.13.1  # imported directly by scripts/mcp_smoke_client.py (also pulled in by mcp)
