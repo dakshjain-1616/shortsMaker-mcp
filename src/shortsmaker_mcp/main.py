@@ -60,6 +60,18 @@ def _health_live(request):
     return JSONResponse({"status": "ok", "service": "shortsmaker-mcp", "version": server.version})
 
 
+class _NormalizeMcpEndpointPath:
+    """Serve the canonical MCP endpoint without redirecting clients that omit its final slash."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/mcp":
+            scope = {**scope, "path": "/mcp/", "raw_path": b"/mcp/"}
+        await self.app(scope, receive, send)
+
+
 def _protected_resource_metadata(request):
     if not settings.resource_url or not settings.oauth_issuer:
         return JSONResponse({"detail": "MCP OAuth is not configured."}, status_code=503)
@@ -116,10 +128,11 @@ def create_app() -> ASGIApp:
     ]
     if settings.dashboard_enabled:
         routes[3:3] = [Route("/dashboard", _dashboard), Route("/dashboard/", _dashboard)]
-    return Starlette(
+    application = Starlette(
         routes=routes,
         lifespan=lifespan,
     )
+    return _NormalizeMcpEndpointPath(application)
 
 
 app = create_app()

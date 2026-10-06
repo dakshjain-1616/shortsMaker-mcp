@@ -537,6 +537,16 @@ def test_get_without_session_and_wrong_methods(stack):
         assert response.headers["allow"] == "POST"
 
 
+def test_mcp_endpoint_without_trailing_slash_does_not_redirect(stack):
+    missing = _post(stack, path="/mcp")
+    assert missing.status_code == 401
+    assert "www-authenticate" in missing.headers
+
+    authorized = _post(stack, {"Authorization": "Bearer good-token"}, path="/mcp")
+    assert authorized.status_code == 200
+    assert authorized.json()["result"]["serverInfo"]["name"] == "ShortsMaker"
+
+
 def test_rebinding_protection_rejects_foreign_host_and_origin(stack):
     auth = {"Authorization": "Bearer good-token"}
     assert _post(stack, {**auth, "Host": "evil.example.com"}).status_code in {400, 403, 421}
