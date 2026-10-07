@@ -296,4 +296,36 @@ def test_with_credits_follows_the_backend_conversion(quote, expected):
     result = video._with_credits(quote, 100)
 
     assert result.get("estimated_credits") == expected
-    assert result["estimated_cost"] == quote.get("estimated_cost") if quote else True
+    assert "estimated_cost" not in result
+
+
+def test_backend_bridge_rejection_does_not_claim_client_token_expired():
+    from shortsmaker_mcp.backend_client import BackendAPIError
+    error = _common._backend_error(BackendAPIError(401, 'Signature verification failed'))
+    assert 'administrator' in str(error)
+    assert 'expired' not in str(error)
+    assert 'Signature verification' not in str(error)
+
+
+def test_persisted_diagnostics_are_hidden_but_intended_urls_survive():
+    value = {
+        'video_url': 'https://media.example/video.mp4?signature=user-media-link',
+        'authorization_url': 'https://provider.example/authorize?state=required-state',
+        'posts': [{'last_error': 'HTTP error https://private.example/api?access_token=SECRET'}],
+        'error': {'request': 'https://internal.example/engine', 'password': 'SECRET'},
+        'empty': {'error': None, 'last_error': ''},
+    }
+    result = _common._public_result(value)
+    assert 'SECRET' not in str(result) and 'internal.example' not in str(result)
+    assert result['video_url'] == value['video_url']
+    assert result['authorization_url'] == value['authorization_url']
+    assert result['empty'] == value['empty']
+    assert value['posts'][0]['last_error'].endswith('SECRET')
+
+
+@pytest.mark.parametrize('status', [400, 401, 402, 403, 404, 409, 422])
+def test_backend_error_diagnostics_cannot_disclose_internal_requests(status):
+    from shortsmaker_mcp.backend_client import BackendAPIError
+    diagnostic = 'HTTP error https://10.0.0.5/engine/resolve?access_token=SECRET'
+    message = str(_common._backend_error(BackendAPIError(status, diagnostic)))
+    assert 'SECRET' not in message and '10.0.0.5' not in message and '/engine/' not in message

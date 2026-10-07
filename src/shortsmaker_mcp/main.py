@@ -17,6 +17,7 @@ from .backend_client import BackendClient
 from .config import Settings, load_settings
 from .oauth_auth import BearerValidationMiddleware, TokenValidator
 from .rate_limit import RequestRateLimiter
+from .tool_auth import ToolAuthMiddleware
 from .tools import register_tools
 
 settings = load_settings()
@@ -36,6 +37,7 @@ server = MCPServer(
     version="0.2.0",
 )
 register_tools(server, backend)
+server.middleware.append(ToolAuthMiddleware(settings.resource_url, server.list_tools))
 _DASHBOARD_PATH = Path(__file__).with_name("static") / "dashboard.html"
 
 
@@ -81,7 +83,8 @@ def _protected_resource_metadata(request):
             "authorization_servers": [settings.oauth_issuer],
             "scopes_supported": ["mcp:read", "mcp:write"],
             "bearer_methods_supported": ["header"],
-        }
+        },
+        headers={"Cache-Control": "no-store"}
     )
 
 

@@ -155,6 +155,16 @@ class BearerValidationMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        original_send = send
+
+        async def no_store_send(message):
+            if message["type"] == "http.response.start":
+                headers = [(key, value) for key, value in message.get("headers", [])
+                           if key.lower() != b"cache-control"]
+                message = {**message, "headers": [*headers, (b"cache-control", b"no-store")]}
+            await original_send(message)
+
+        send = no_store_send
         if not self.validator.issuer or not self.validator.resource or not self.resource_metadata_url:
             await JSONResponse(
                 {"detail": "MCP OAuth is not configured."}, status_code=503

@@ -236,7 +236,7 @@ def test_read_tools_return_backend_data(stack):
 
 def test_price_quote_includes_credits_matching_the_charge(stack):
     quote = call(stack, "shortsmaker_resolve_video_price", {"total_length": 12}).structured_content
-    assert quote["estimated_cost"] == 0.10 and quote["estimated_credits"] == 10
+    assert "estimated_cost" not in quote and quote["estimated_credits"] == 10
     job = call(stack, "shortsmaker_create_video", {"niche": "x", "total_length": 12, "idempotency_key": "q", "confirm": True}).structured_content
     assert job["credits_cost"] == quote["estimated_credits"]
 
@@ -580,3 +580,42 @@ def test_dashboard_flag_and_health(stack):
     assert httpx.get(f"{stack['limited']}/dashboard").status_code == 404
     health = httpx.get(f"{stack['mcp']}/health/live").json()
     assert health["status"] == "ok" and health["version"] == "0.2.0"
+
+
+@pytest.mark.parametrize('version', ['2025-03-26', '2025-06-18', '2025-11-25'])
+def test_client_protocols_publish_oauth_tool_metadata(stack, version):
+    headers = {**MCP_HEADERS, 'Authorization': 'Bearer '+oauth_token(stack)}
+    initialized = httpx.post(stack['mcp']+'/mcp/', headers=headers, json={
+        **INIT, 'params': {**INIT['params'], 'protocolVersion': version},
+    })
+    assert initialized.status_code == 200
+    headers['MCP-Protocol-Version'] = initialized.json()['result']['protocolVersion']
+    response = httpx.post(stack['mcp']+'/mcp/', headers=headers, json={
+        'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list',
+    })
+    assert response.status_code == 200
+    tools = response.json()['result']['tools']
+    assert len(tools) == 29
+    for tool in tools:
+        scope = 'mcp:read' if tool['annotations']['readOnlyHint'] else 'mcp:write'
+        expected = [{'type': 'oauth2', 'scopes': [scope]}]
+        assert tool['securitySchemes'] == expected
+        assert tool['_meta']['securitySchemes'] == expected
+    assert 'bridge' not in response.text.lower()
+
+
+def test_scope_upgrade_has_tool_level_oauth_challenge_without_backend_call(stack):
+    response = httpx.post(stack['mcp']+'/mcp/', headers={
+        **MCP_HEADERS, 'Authorization': 'Bearer '+oauth_token(stack, scope='mcp:read'),
+        'MCP-Protocol-Version': '2025-11-25',
+    }, json={
+        'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+        'params': {'name': 'shortsmaker_pause_workflow', 'arguments': {'workflow_id': UUID0, 'confirm': True}},
+    })
+    assert response.status_code == 200
+    result = response.json()['result']
+    assert result['isError'] is True
+    challenge = result['_meta']['mcp/www_authenticate'][0]
+    assert 'error="insufficient_scope"' in challenge
+    assert 'error_description=' in challenge and 'scope="mcp:write"' in challenge
+    assert backend_calls(stack) == []

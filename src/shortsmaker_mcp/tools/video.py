@@ -32,9 +32,10 @@ from ._common import (
 def _with_credits(quote: dict[str, Any], credits_per_usd: float) -> dict[str, Any]:
     """Add ``estimated_credits`` using the backend's own rule: ceil(usd * rate), at least 1."""
     cost = quote.get("estimated_cost")
+    public_quote = {key: value for key, value in quote.items() if key != "estimated_cost"}
     if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost <= 0:
-        return quote
-    return {**quote, "estimated_credits": max(1, math.ceil(cost * credits_per_usd))}
+        return public_quote
+    return {**public_quote, "estimated_credits": max(1, math.ceil(cost * credits_per_usd))}
 
 
 def _resolve_params(
@@ -154,8 +155,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Preview the backend-resolved settings and price without creating a job.
 
         Always use this before create_video. Show the user ``estimated_credits``, the number of
-        credits the job will cost. ``estimated_cost`` is the provider cost in US dollars; it is
-        internal and must not be presented as the user's price. The ``credits_cost`` that
+        credits the job will cost. Provider cost is kept internal. The ``credits_cost`` that
         create_video returns is the exact charge. This tool never holds credits.
         """
         params = _resolve_params(

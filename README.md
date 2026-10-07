@@ -77,3 +77,6 @@ instance; use a gateway limiter if a shared deployment-wide limit is needed.
 Run `ruff check src tests app.py`, `pytest -q`, and `python -m compileall -q src tests app.py`. Automated MCP tests use a mock backend and do not spend credits or publish content. They include separate-process tests that initialize on one instance and list/call tools on another, and verify identity/scope isolation across requests. Verify login, refresh, a read, and an approved write with real OAuth-capable clients on isolated test accounts. See the [acceptance checklist](docs/VERCEL.md#acceptance).
 
 The legacy `scripts/mcp_smoke_client.py` accepts an already-issued MCP OAuth access token through `SHORTSMAKER_ACCESS_TOKEN` for protocol checks; it does not perform login itself. Obtain a token through an OAuth-capable client. A regular ShortsMaker website token cannot be used for MCP.
+
+Client setup, OAuth redirection, public/private response boundaries, and the remaining real-client
+acceptance checks are recorded in [Client compatibility](docs/CLIENT_COMPATIBILITY.md).

@@ -103,6 +103,7 @@ def test_protected_resource_metadata_advertises_exact_resource_and_issuer(monkey
     assert response.status_code == 200
     assert response.json()["resource"] == RESOURCE
     assert response.json()["authorization_servers"] == [ISSUER]
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_http_challenge_advertises_resource_metadata_and_scopes():
@@ -123,6 +124,7 @@ def test_http_challenge_advertises_resource_metadata_and_scopes():
         return missing, bad, good
 
     missing, bad, good = asyncio.run(check())
+    assert all(response.headers["cache-control"] == "no-store" for response in (missing, bad, good))
     assert missing.status_code == 401
     assert 'resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp"' in missing.headers["www-authenticate"]
     assert 'scope="mcp:read mcp:write"' in missing.headers["www-authenticate"]

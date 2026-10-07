@@ -146,15 +146,18 @@ def _backend_error(exc: Exception) -> ToolError:
     if isinstance(exc, BackendUnavailable):
         return ToolError("ShortsMaker API is unavailable. Try again shortly.")
     if isinstance(exc, BackendAPIError):
-        if exc.status_code == 401:
-            return ToolError("Your ShortsMaker access token expired or is invalid.")
-        if exc.status_code == 402:
-            return ToolError(exc.detail)
-        if exc.status_code == 429:
-            return ToolError("ShortsMaker rate limit reached. Try again shortly.")
+        # Upstream diagnostics can contain private URLs or credentials, even on a 4xx.
+        messages = {
+            401: "ShortsMaker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
+            402: "Insufficient credits. Check your balance and the quoted cost before retrying.",
+            403: "Your connected account does not have permission for this action.",
+            404: "The requested item was not found.",
+            409: "This action conflicts with the item's current state.",
+            429: "ShortsMaker rate limit reached. Try again shortly.",
+        }
         if exc.status_code >= 500:
             return ToolError("ShortsMaker could not complete that request. Try again shortly.")
-        return ToolError(exc.detail)
+        return ToolError(messages.get(exc.status_code, "ShortsMaker rejected this request. Check the options and try again."))
     return ToolError("ShortsMaker could not complete that request.")
 
 def _require_confirmation(confirm: bool, action: str) -> None:
@@ -163,6 +166,22 @@ def _require_confirmation(confirm: bool, action: str) -> None:
             f"{action} was not performed. First show the user the exact action and its "
             "cost/destination, obtain explicit approval, then call again with confirm=true."
         )
+
+def _public_result(value: Any) -> Any:
+    """Persisted failure diagnostics can contain private request URLs or provider secrets."""
+    if isinstance(value, list):
+        return [_public_result(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: (
+                "This operation failed. Check its status in ShortsMaker."
+                if key in {"error", "last_error"} and item
+                else _public_result(item)
+            )
+            for key, item in value.items()
+        }
+    return value
+
 
 async def _api(
     backend: BackendClient,
@@ -183,6 +202,6 @@ async def _api(
 
     try:
         token = backend.bridge_token(principal)
-        return await backend.request(method, path, token, params=params, body=body)
+        return _public_result(await backend.request(method, path, token, params=params, body=body))
     except (BackendUnavailable, BackendAPIError) as exc:
         raise _backend_error(exc) from exc
