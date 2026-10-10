@@ -25,7 +25,7 @@ enabled on Vercel. See [deployment and acceptance steps](docs/VERCEL.md).
 
 ## Connect a client
 
-Add the exact public HTTPS MCP URL, such as `https://mcp.example.com/mcp/`, to a client that supports remote Streamable HTTP MCP and OAuth. No bearer token or custom Authorization header belongs in the client configuration. The client should follow the 401 challenge, discover OAuth metadata, launch the backend login page, and exchange a PKCE authorization code.
+Add the exact public HTTPS MCP URL, such as `https://mcp.example.com/mcp/`, to a client that supports remote Streamable HTTP MCP and OAuth. No bearer token or custom Authorization header belongs in the client configuration. The client should follow the 401 challenge, discover OAuth metadata, open the configured real frontend auth page, and exchange a PKCE authorization code after frontend consent.
 
 `.mcp.json.example` is a URL-only Claude Code example. In Claude.ai or ChatGPT, add a custom remote MCP connector using the same URL. Verify each client version against staging before enabling production users.
 
@@ -41,7 +41,7 @@ cp .env.example .env
 uvicorn shortsmaker_mcp.main:app --app-dir src --host 127.0.0.1 --port 8002 --env-file .env
 ```
 
-Set `MCP_BACKEND_API_URL` and `MCP_OAUTH_ISSUER` to the local backend origin, `MCP_RESOURCE_URL` to `http://127.0.0.1:8002/mcp/`, and `MCP_BRIDGE_SECRET` to the same dedicated key as the backend. The backend also needs its OAuth signing key, the Postgres OAuth state table, and existing authentication settings. Localhost HTTP is for development; public deployments require HTTPS.
+Set `MCP_BACKEND_API_URL` to the local backend origin, `MCP_RESOURCE_URL` to `http://127.0.0.1:8002/mcp/`, and `MCP_BRIDGE_SECRET` to the same dedicated key as the backend. The OAuth issuer defaults to the backend URL. The backend also needs its OAuth signing key, the Postgres OAuth state table, and existing authentication settings. Localhost HTTP is for development; public deployments require HTTPS.
 
 `/health/live` is unauthenticated. `/mcp/` requires an OAuth bearer token and returns a 401 challenge with protected-resource metadata when one is missing. `/dashboard` is a private development aid: opt in locally with `MCP_DASHBOARD_ENABLED=true`. Use an OAuth-capable client for end-to-end login tests.
 
@@ -58,16 +58,15 @@ The server also exposes guided workflow prompts. Video listing is paginated usin
 | Variable | Purpose |
 |---|---|
 | `MCP_BACKEND_API_URL` | Platform API base URL. |
-| `MCP_OAUTH_ISSUER` | Backend OAuth issuer origin. |
+| `MCP_OAUTH_ISSUER` | Optional backend OAuth issuer override; defaults to `MCP_BACKEND_API_URL`. |
 | `MCP_RESOURCE_URL` | Exact public `/mcp/` URL, including trailing slash. |
 | `MCP_BRIDGE_SECRET` | Dedicated key shared with the backend for API assertions. |
-| `MCP_PUBLIC_URL` | Public origin for Host and Origin validation. |
 | `MCP_HOST`, `MCP_PORT` | Listener address and port. |
 | `MCP_DASHBOARD_ENABLED` | Private local dashboard toggle; set false publicly. |
 | `MCP_RATE_LIMIT_REQUESTS`, `MCP_RATE_LIMIT_WINDOW_SECONDS` | Per-process request limiter. |
 | `FORWARDED_ALLOW_IPS` | Reverse proxy IPs trusted by uvicorn. |
-| `MCP_CREDITS_PER_USD` | Must match backend `CREDITS_PER_DOLLAR`. |
 
+The transport origin is derived from `MCP_RESOURCE_URL`; no second public URL setting is needed.
 Protocol requests do not require session affinity. Preserve Authorization, Host, Origin, and
 MCP protocol headers through the proxy. The in-process rate limiter applies separately to each
 instance; use a gateway limiter if a shared deployment-wide limit is needed.

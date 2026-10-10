@@ -280,25 +280,6 @@ def test_video_options_passes_mode_and_resolution_to_lengths():
     assert result["config"]["path"] == "/api/config"
 
 
-@pytest.mark.parametrize(
-    "quote,expected",
-    [
-        ({"estimated_cost": 0.81}, 81),
-        ({"estimated_cost": 0.811}, 82),  # rounds up, like the backend
-        ({"estimated_cost": 0.001}, 1),  # never below one credit
-        ({"estimated_cost": 0}, None),
-        ({"estimated_cost": None}, None),
-        ({"estimated_cost": True}, None),
-        ({}, None),
-    ],
-)
-def test_with_credits_follows_the_backend_conversion(quote, expected):
-    result = video._with_credits(quote, 100)
-
-    assert result.get("estimated_credits") == expected
-    assert "estimated_cost" not in result
-
-
 def test_backend_bridge_rejection_does_not_claim_client_token_expired():
     from shortsmaker_mcp.backend_client import BackendAPIError
     error = _common._backend_error(BackendAPIError(401, 'Signature verification failed'))

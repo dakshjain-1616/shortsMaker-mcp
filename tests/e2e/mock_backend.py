@@ -119,7 +119,7 @@ async def api(request: Request):
     if path == "/api/payments/credit-status":
         return JSONResponse({"balance": CREDITS[user]})
     if path == "/api/resolve":
-        return JSONResponse({"estimated_cost": 0.10, "exact": True, "mode": "lite", "total_length": 12.0})
+        return JSONResponse({"estimated_cost": 0.10, "estimated_credits": 10, "exact": True, "mode": "lite", "total_length": 12.0})
     if path == "/api/jobs" and request.method == "POST":
         return await create_job(request, user, body or {})
     if path == "/api/jobs" and request.method == "GET":

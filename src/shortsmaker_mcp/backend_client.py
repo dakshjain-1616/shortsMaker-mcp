@@ -31,7 +31,6 @@ class BackendAPIError(Exception):
 class BackendClient:
     def __init__(self, settings: Settings):
         self.base_url = settings.backend_api_url
-        self.credits_per_usd = settings.credits_per_usd
         self.bridge_secret = settings.bridge_secret
         # One pooled client: avoids a TCP/TLS handshake per upstream call.
         self._client = httpx.AsyncClient(
@@ -99,6 +98,3 @@ class BackendClient:
             message = detail if isinstance(detail, str) else f"Request failed ({response.status_code})."
             raise BackendAPIError(response.status_code, message[:500])
         return result
-
-    async def validate_token(self, token: str) -> Any:
-        return await self.request("GET", "/api/features", token)

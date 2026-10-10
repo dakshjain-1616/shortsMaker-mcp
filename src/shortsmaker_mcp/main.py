@@ -46,9 +46,8 @@ def _transport_security(settings: Settings) -> TransportSecuritySettings:
     hosts = ["localhost:*", "127.0.0.1:*", "[::1]:*"]
     origins = ["http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"]
 
-    public_url = settings.public_url or settings.resource_url
-    if public_url:
-        public = urlparse(public_url)
+    if settings.resource_url:
+        public = urlparse(settings.resource_url)
         hosts += [public.netloc, f"{public.hostname}:*"]
         origins.append(f"{public.scheme}://{public.netloc}")
     return TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=origins)

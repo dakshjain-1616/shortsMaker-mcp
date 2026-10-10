@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -27,15 +26,6 @@ from ._common import (
     _optional_params,
     _require_confirmation,
 )
-
-
-def _with_credits(quote: dict[str, Any], credits_per_usd: float) -> dict[str, Any]:
-    """Add ``estimated_credits`` using the backend's own rule: ceil(usd * rate), at least 1."""
-    cost = quote.get("estimated_cost")
-    public_quote = {key: value for key, value in quote.items() if key != "estimated_cost"}
-    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost <= 0:
-        return public_quote
-    return {**public_quote, "estimated_credits": max(1, math.ceil(cost * credits_per_usd))}
 
 
 def _resolve_params(
@@ -168,7 +158,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             niche=niche,
         )
         quote = _dict_result(await _api(backend, "GET", "/api/resolve", params=params))
-        return _with_credits(quote, backend.credits_per_usd)
+        return {key: value for key, value in quote.items() if key != "estimated_cost"}
 
     @server.tool(
         title="List video jobs",

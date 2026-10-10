@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
-from mcp.types import Tool
+from mcp.types import CallToolResult, TextContent, Tool
 from pydantic import BaseModel
 
 from .oauth_auth import current_principal, resource_metadata_url
@@ -37,13 +37,11 @@ class ToolAuthMiddleware:
                         f'scope="{scope}", error="insufficient_scope", '
                         'error_description="Additional ShortsMaker permission is required"'
                     )
-                    return {
-                        "content": [
-                            {"type": "text", "text": f"This tool requires {scope} authorization."}
-                        ],
-                        "isError": True,
-                        "_meta": {"mcp/www_authenticate": [challenge]},
-                    }
+                    return CallToolResult(
+                        content=[TextContent(text=f"This tool requires {scope} authorization.")],
+                        isError=True,
+                        _meta={"mcp/www_authenticate": [challenge]},
+                    )
         result = await call_next(ctx)
         if ctx.method != "tools/list":
             return result

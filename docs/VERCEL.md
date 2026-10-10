@@ -36,11 +36,12 @@ OAuth challenge before the method check.
    backend's schema, including `supabase/schema/18_mcp_oauth_state.sql`, only to that database.
    Keep `RUN_PUBLISHER_IN_API=false` and `RUN_SCHEDULER_IN_API=false` for authentication tests.
 2. Start ngrok forwarding to the backend's HTTP listener, for example `ngrok http 8001`. Use
-   the HTTPS origin it supplies, without a path, as the backend's `MCP_OAUTH_ISSUER` and
-   `API_BASE_URL`, so returned API links also point to the local test backend.
+   the HTTPS origin it supplies, without a path, as the backend's `API_BASE_URL`, so returned
+   API links and the default OAuth issuer both point to the local test backend.
 3. Set the backend's `MCP_RESOURCE_URL` to the stable Vercel test-project URL including `/mcp/`.
-   Configure its RSA private signing key, `MCP_OAUTH_KID`, and a dedicated random bridge secret
-   of at least 32 characters. Keep the signing key and bridge secret stable across restarts.
+   Configure its RSA private signing key and a dedicated random bridge secret of at least 32
+   characters. The key ID has a stable default. Keep the signing key and bridge secret stable
+   across restarts.
 4. Use disposable test accounts and the backend's existing sign-in configuration. Google login
    needs the ngrok origin registered for that Google client. A real login must resolve an active
    user in the local Postgres database. The automated tests' fixture login is not a public login.
@@ -66,17 +67,15 @@ backend and Vercel issuer/API settings, restart/redeploy, and reconnect the OAut
 | Vercel variable | Example / requirement |
 |---|---|
 | `MCP_BACKEND_API_URL` | `https://your-backend.ngrok-free.app` |
-| `MCP_OAUTH_ISSUER` | Same backend HTTPS origin; must match the backend issuer exactly. |
 | `MCP_RESOURCE_URL` | `https://shortsmaker-mcp-test.vercel.app/mcp/`; must match the backend value exactly. |
-| `MCP_PUBLIC_URL` | `https://shortsmaker-mcp-test.vercel.app`; optional, but if set must match the resource origin. |
 | `MCP_BRIDGE_SECRET` | Same dedicated 32+ character secret as the backend. |
 | `MCP_DASHBOARD_ENABLED` | `false` |
 | `MCP_API_TIMEOUT_SECONDS` | `45` |
 | `MCP_API_CONNECT_TIMEOUT_SECONDS` | `10` |
-| `MCP_CREDITS_PER_USD` | `100`, or the backend's configured `CREDITS_PER_DOLLAR`. |
 
 On Vercel, startup rejects missing OAuth settings, non-HTTPS/local URLs, an incorrect resource
-path, mismatched public origin, a short bridge secret, or an enabled dashboard. Enter settings
+path, a short bridge secret, or an enabled dashboard. The issuer defaults to
+`MCP_BACKEND_API_URL`; transport origin checks derive from `MCP_RESOURCE_URL`. Enter settings
 for the environment used by the stable test-project domain. Vercel's environment name does not
 change the backend database: that backend must remain connected to local test Postgres.
 

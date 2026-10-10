@@ -9,9 +9,9 @@ from dotenv import load_dotenv
 
 _EPILOG = """\
 Settings come from environment variables or a .env file in the working directory:
-  MCP_BACKEND_API_URL (required), MCP_HOST, MCP_PORT, MCP_PUBLIC_URL,
+  MCP_BACKEND_API_URL (required), MCP_HOST, MCP_PORT,
   MCP_API_TIMEOUT_SECONDS, MCP_API_CONNECT_TIMEOUT_SECONDS, MCP_DASHBOARD_ENABLED,
-  MCP_RATE_LIMIT_REQUESTS, MCP_RATE_LIMIT_WINDOW_SECONDS, MCP_CREDITS_PER_USD.
+  MCP_RATE_LIMIT_REQUESTS, MCP_RATE_LIMIT_WINDOW_SECONDS.
 See the README for what each one does."""
 
 

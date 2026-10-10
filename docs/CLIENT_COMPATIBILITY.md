@@ -10,7 +10,7 @@ are not implemented.
 
 | Client | Connection path | Implementation and evidence | Remaining acceptance |
 |---|---|---|---|
-| Claude.ai, Claude Desktop remote connectors | Public remote connector URL; CIMD or DCR | Public OAuth discovery, validated CIMD, PKCE, login/consent, client-specific callback. Real Cognito login, callback/code exchange, refresh, reads, and metadata writes observed with the deployed MCP and local backend. | Repeat acceptance after deploying these new changes; test Google only if enabled. |
+| Claude.ai, Claude Desktop remote connectors | Public remote connector URL; CIMD or DCR | Public OAuth discovery, validated CIMD, PKCE, frontend handoff/consent, client-specific callback. Real Cognito login, callback/code exchange, refresh, reads, and metadata writes observed with the deployed MCP and local backend. | Repeat acceptance after deploying these new changes; test Google only if enabled. |
 | ChatGPT custom MCP/plugin | OAuth connection; public CIMD or DCR | Per-tool `securitySchemes` in the wire catalogue and `_meta` mirror, plus `mcp/www_authenticate` scope-upgrade challenges. HTTP missing/invalid-token challenges remain enforced. | Complete linking, refresh, a read, and a confirmed write in an actual ChatGPT account. |
 | Claude Code | HTTP remote server; browser OAuth | Same public-client OAuth and HTTP transport. | Actual CLI login/refresh and tools. |
 | VS Code / GitHub Copilot | HTTP MCP server; DCR and browser OAuth | Native registration accepts its HTTPS/loopback callbacks and supported grant extensions. Native loopback IP callback ports may vary; host/path/query stay strict. Regression covers token exchange using the actual chosen callback. | Actual editor login, loopback or hosted return, and tools. |
@@ -28,11 +28,13 @@ accept arbitrary callbacks is not a compatibility solution.
    backend issuer; backend discovery names authorization, token, registration, and JWKS routes.
 2. The client registers or uses validated public client metadata and opens backend
    `/oauth/authorize`. It retains its PKCE verifier and its own `state`.
-3. The backend authenticates with normal Cognito/Google services, resolves the active user in
-   its configured Postgres, and asks for consent. No synthetic login is shipped.
-4. Approval returns a visible HTML continue link plus best-effort automatic navigation to the
-   saved, validated client callback with `code`, `state`, and `iss`. Manual navigation remains
-   available if a webview blocks the script. Denial returns the OAuth error to the callback.
+3. The backend redirects to the configured real frontend route with short-lived request proof
+   in the fragment. The frontend reuses website sign-in and submits JSON consent using its
+   server-side proxy and the normal website access token. No backend HTML/login is shipped.
+4. Consent returns JSON `redirect_url`. The frontend renders its Continue link and performs
+   best-effort top-level navigation to the validated client callback. Denial returns its
+   OAuth error URL in the same JSON shape. The sibling frontend implements the route/proxies;
+   deploy them with this API-only backend.
 5. The client exchanges the code and verifier. The actual callback URI must match at exchange,
    including the native listener port selected during authorization. Code/refresh rotation is
    atomic; replay and revoked refresh credentials are rejected.
@@ -40,8 +42,9 @@ accept arbitrary callbacks is not a compatibility solution.
    validates that assertion and independently checks scope, route allowlist, user status,
    and ownership. The OAuth access token is not a general Platform API credential.
 
-All three deployed values must agree: `MCP_OAUTH_ISSUER`, exact `MCP_RESOURCE_URL`, and
-`MCP_BRIDGE_SECRET`. `MCP_BACKEND_API_URL` must reach the intended backend. A bridge mismatch
+The backend URL supplies `MCP_OAUTH_ISSUER` by default. The exact `MCP_RESOURCE_URL` and
+`MCP_BRIDGE_SECRET` must agree across backend and MCP. `MCP_BACKEND_API_URL` must reach the
+intended backend. A bridge mismatch
 fails at tool calls even after successful browser login. It is now reported as connector
 backend authentication/configuration failure, not an expired user access token.
 
@@ -103,3 +106,8 @@ Existing real-session backend logs also show the user's Cognito sign-in, consent
 exchange/refresh, and deployed-MCP read/metadata-write requests succeeding with local data.
 This observation is for Claude's published client identity. Other vendor account/browser
 acceptance remains pending. No production database was accessed and changes remain uncommitted.
+
+The backend PR now removes all temporary HTML and requires the real frontend route/proxies.
+The earlier observed HTML-based browser acceptance is historical; repeat real-client browser
+acceptance after deploying the frontend implementation described in the
+[frontend guide](../../shortsmaker-backend/docs/MCP_OAUTH_FRONTEND_AGENT_GUIDE.md).

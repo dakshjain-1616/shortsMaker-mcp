@@ -619,3 +619,25 @@ def test_scope_upgrade_has_tool_level_oauth_challenge_without_backend_call(stack
     assert 'error="insufficient_scope"' in challenge
     assert 'error_description=' in challenge and 'scope="mcp:write"' in challenge
     assert backend_calls(stack) == []
+
+
+def test_scope_denial_is_a_valid_result_for_the_official_mcp_client(stack):
+    async def check():
+        token = oauth_token(stack, scope="mcp:read")
+        async with httpx2.AsyncClient(
+            headers={"Authorization": f"Bearer {token}"}, trust_env=False
+        ) as http:
+            async with Client(
+                streamable_http_client(f"{stack['mcp']}/mcp/", http_client=http),
+                client_info=Implementation(name="scope-e2e", version="1"),
+            ) as client:
+                return await client.call_tool(
+                    "shortsmaker_pause_workflow",
+                    {"workflow_id": UUID0, "confirm": True},
+                )
+
+    result = asyncio.run(check())
+
+    assert result.is_error
+    assert "mcp:write" in result.meta["mcp/www_authenticate"][0]
+    assert backend_calls(stack) == []
