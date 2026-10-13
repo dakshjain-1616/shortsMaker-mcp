@@ -25,7 +25,7 @@ enabled on Vercel. See [deployment and acceptance steps](docs/VERCEL.md).
 
 ## Connect a client
 
-Add the exact public HTTPS MCP URL, such as `https://mcp.example.com/mcp/`, to a client that supports remote Streamable HTTP MCP and OAuth. No bearer token or custom Authorization header belongs in the client configuration. The client should follow the 401 challenge, discover OAuth metadata, open the configured real frontend auth page, and exchange a PKCE authorization code after frontend consent.
+Add the public HTTPS MCP URL, such as `https://mcp.example.com/mcp/`, to a client that supports remote Streamable HTTP MCP and OAuth. `/mcp` also works for HTTP requests and OAuth resource parameters; discovery and tokens use `/mcp/` as the canonical resource. No bearer token or custom Authorization header belongs in the client configuration. The client should follow the 401 challenge, discover OAuth metadata, open the configured real frontend auth page, and exchange a PKCE authorization code after frontend consent.
 
 `.mcp.json.example` is a URL-only Claude Code example. In Claude.ai or ChatGPT, add a custom remote MCP connector using the same URL. Verify each client version against staging before enabling production users.
 

@@ -133,13 +133,13 @@ def backend_calls(stack) -> list[dict]:
     return [c for c in httpx.get(f"{stack['backend']}/__calls").json() if c["path"] != "/api/features"]
 
 
-def run(stack, coro_fn, token="good-token", base="mcp"):
+def run(stack, coro_fn, token="good-token", base="mcp", path="/mcp/"):
     async def go():
         async with httpx2.AsyncClient(
             headers={"Authorization": f"Bearer {oauth_token(stack, token, base)}"}, trust_env=False
         ) as http:
             async with Client(
-                streamable_http_client(f"{stack[base]}/mcp/", http_client=http),
+                streamable_http_client(f"{stack[base]}{path}", http_client=http),
                 client_info=Implementation(name="e2e", version="1"),
             ) as client:
                 return await coro_fn(client)
@@ -170,6 +170,18 @@ def test_tool_and_prompt_catalogue(stack):
         assert tool.output_schema is not None, tool.name
         if not tool.annotations.read_only_hint:
             assert "confirm" in tool.input_schema["properties"], tool.name
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+def test_modern_protocol_discovers_and_calls_a_read_tool(stack, path):
+    async def verify(client):
+        assert client.protocol_version == "2026-07-28"
+        assert client.session.discover_result is not None
+        assert len((await client.list_tools()).tools) == 29
+        result = await client.call_tool("shortsmaker_get_credit_status", {})
+        assert result.structured_content == {"balance": 100}
+
+    run(stack, verify, path=path)
 
 
 def test_initialize_and_tools_work_across_separate_instances(stack):

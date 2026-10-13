@@ -1,6 +1,8 @@
 # Client compatibility and authorization verification
 
-Use the exact public `https://<mcp-host>/mcp/` URL. `/mcp` is also accepted without a redirect.
+Use the public `https://<mcp-host>/mcp/` URL. `/mcp` is also accepted without a redirect,
+including when an OAuth client sends that spelling as its `resource` parameter. Discovery
+and issued tokens use the canonical `/mcp/` resource.
 This service supports OAuth-protected Streamable HTTP with JSON responses. It does not serve
 legacy HTTP/SSE endpoints or a standalone stdio entrypoint. Clients must support Streamable
 HTTP plus public-client authorization code/PKCE; client-secret and private-key-JWT exchanges
@@ -11,11 +13,14 @@ are not implemented.
 | Client | Connection path | Implementation and evidence | Remaining acceptance |
 |---|---|---|---|
 | Claude.ai, Claude Desktop remote connectors | Public remote connector URL; CIMD or DCR | Public OAuth discovery, validated CIMD, PKCE, frontend handoff/consent, client-specific callback. Real Cognito login, callback/code exchange, refresh, reads, and metadata writes observed with the deployed MCP and local backend. | Repeat acceptance after deploying these new changes; test Google only if enabled. |
-| ChatGPT custom MCP/plugin | OAuth connection; public CIMD or DCR | Per-tool `securitySchemes` in the wire catalogue and `_meta` mirror, plus `mcp/www_authenticate` scope-upgrade challenges. HTTP missing/invalid-token challenges remain enforced. | Complete linking, refresh, a read, and a confirmed write in an actual ChatGPT account. |
+| ChatGPT custom MCP/plugin | OAuth connection; public CIMD or DCR | Per-tool `securitySchemes` in the wire catalogue and `_meta` mirror, plus `mcp/www_authenticate` scope-upgrade challenges. CIMD can advertise both `none` and `private_key_jwt`; the backend selects its supported `none` method even when the legacy singular field prefers `private_key_jwt`. DCR still requires a public PKCE client. HTTP missing/invalid-token challenges remain enforced. | Deploy the backend fix, then complete linking, refresh, a read, and a confirmed write in an actual ChatGPT account. |
 | Claude Code | HTTP remote server; browser OAuth | Same public-client OAuth and HTTP transport. | Actual CLI login/refresh and tools. |
+| OpenClaw | Set `transport: "streamable-http"` and `auth: "oauth"` for the public URL; run `openclaw mcp login <name>`. | Its default remote transport is SSE, which this server does not serve. The documented browser PKCE path can use public DCR. | Actual shared-operator and, if needed, per-requester login, refresh, read, and confirmed write. |
+| Hermes Agent | Set the remote `url` and `auth: oauth`; run `hermes mcp login <name>`. | Its published CIMD uses public PKCE, `application_type: native`, and fixed loopback callbacks on ports 27890–27894, all accepted by the backend's validation rules. DCR is available as a fallback. | Actual CLI login, refresh, read, and confirmed write. |
 | VS Code / GitHub Copilot | HTTP MCP server; DCR and browser OAuth | Native registration accepts its HTTPS/loopback callbacks and supported grant extensions. Native loopback IP callback ports may vary; host/path/query stay strict. Regression covers token exchange using the actual chosen callback. | Actual editor login, loopback or hosted return, and tools. |
 | Cursor remote MCP | Remote URL with OAuth in supported versions | Standard HTTP/DCR/public PKCE path. | Actual installed client version and its registered callback/auth mode. |
-| Standard MCP SDK clients | Streamable HTTP and bearer credential from OAuth | Real SDK-client and raw HTTP integration tests. Wire versions tested: 2025-03-26, 2025-06-18, and 2025-11-25. Requests can reach different instances. | Vendor-specific browser/account behavior. |
+| Perplexity custom remote connector | Choose OAuth and Streamable HTTP for the public HTTPS URL. | Perplexity documents OAuth discovery and DCR, but a public DCR registration without a client secret has a reported client-side failure. The backend does not issue a cosmetic secret or support confidential exchange. | Test in a real Perplexity account before claiming support; if the reported failure remains, use a supported public-client path or implement a real confidential-client flow. |
+| Standard MCP SDK clients | Streamable HTTP and bearer credential from OAuth | Real SDK-client and raw HTTP integration tests. Wire versions tested: 2025-03-26, 2025-06-18, 2025-11-25, and 2026-07-28. Requests can reach different instances. | Vendor-specific browser/account behavior. |
 
 The matrix is a support target and evidence record, not a claim that every vendor UI/version
 has been tested. SSE-only, stdio-only, or confidential-client-only configurations require an
@@ -84,6 +89,10 @@ perform the acceptance flow rather than assuming old client caches will update.
 
 - [OpenAI tool authentication](https://developers.openai.com/plugins/build/auth)
 - [OpenAI custom MCP servers](https://developers.openai.com/api/docs/guides/custom-mcp-server)
+- [OpenClaw MCP transports and OAuth](https://docs.openclaw.ai/cli/mcp/transports)
+- [Hermes Agent MCP configuration](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference)
+- [Perplexity custom remote connectors](https://www.perplexity.ai/help-center/en/articles/13915507-adding-custom-remote-connectors)
+- [Perplexity public DCR failure report](https://community.perplexity.ai/t/custom-mcp-connector-fails-with-did-not-return-a-client_secret-for-rfc-7591-compliant-public-client-registrations/5172)
 - [Claude remote connectors](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
 - [Claude Code MCP](https://code.claude.com/docs/en/mcp)
 - [VS Code MCP guide](https://code.visualstudio.com/api/extension-guides/ai/mcp)
