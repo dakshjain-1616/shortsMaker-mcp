@@ -44,7 +44,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             "Then resolve the estimated price with get_video_price and show me a short summary "
             "with estimated_credits. Do not create anything until I approve. After I approve, "
             "call create_video with confirm=true and a fresh idempotency_key, tell me it is "
-            "being made and takes a few minutes, and check it with get_video when I ask."
+            "being made and takes a few minutes, and check it with get_video when I ask.\n"
+            "Handle these cases: if my topic is vague (\"make me a viral video\"), offer 3 concrete "
+            "topics first. If get_video_price says can_afford is false, show the price and my "
+            "balance and send me to https://facelessvideomaker.ai instead of asking to go ahead. "
+            "If create_video times out, retry with the SAME idempotency_key. If I ask for several "
+            "videos, quote the total first and use a new key for each.\n"
+            "Example summary before approval: \"30s Narrated Story about the Roman empire, "
+            "voice Atlas, 18 credits (you have 120). Make it?\""
         )
 
     @server.prompt(
@@ -67,7 +74,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             "15 days, 1 month). Quote the price per video with get_video_price and show a short "
             "summary including how many videos a week it will make. Do not create anything until "
             "I approve. After I approve, call create_series with confirm=true and tell me when "
-            "the first video is planned."
+            "the first video is planned.\n"
+            "Handle these cases: never assume my timezone, ask (offer my likely city's zone). For "
+            "\"every morning\", offer 07:00, 09:00 (recommended) or 11:00. Pass the video length "
+            "in job_defaults.total_length. If a TikTok account is chosen, ask whether posts are "
+            "public or only me.\n"
+            "Example summary before approval: \"Space facts, Mon-Fri at 09:00 and 18:00 "
+            "Europe/London, to MyChannel (YouTube, public), runs until stopped, 30s videos at about "
+            "18 credits each, 10 a week = 180 credits a week. Videos are made 6 hours before each "
+            "post. Start it?\""
         )
 
     @server.prompt(

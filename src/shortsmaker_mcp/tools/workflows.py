@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
@@ -16,6 +17,7 @@ from pydantic import AwareDatetime, Field
 
 from ..backend_client import BackendClient
 from ._common import (
+    ASK_EVERY_TIME,
     IDEMPOTENT_WRITE,
     READ_ONLY,
     WRITE,
@@ -44,11 +46,55 @@ def _workflow_days(days: list[int]) -> list[int]:
 def _workflow_times(times: list[str]) -> list[str]:
     if not times or len(times) > 8:
         raise ToolError("times_of_day must contain 1-8 values in HH:MM 24-hour form.")
-    cleaned = sorted(set(time.strip() for time in times if isinstance(time, str)))
-    if len(cleaned) != len(times) or any(len(time) != 5 or time[2] != ":" or not time[:2].isdigit() or not time[3:].isdigit()
+    if not all(isinstance(time, str) for time in times):
+        raise ToolError("times_of_day must contain values in HH:MM 24-hour form.")
+    cleaned = sorted({time.strip() for time in times})
+    if any(len(time) != 5 or time[2] != ":" or not time[:2].isdigit() or not time[3:].isdigit()
            or int(time[:2]) > 23 or int(time[3:]) > 59 for time in cleaned):
         raise ToolError("times_of_day must contain values in HH:MM 24-hour form.")
     return cleaned
+
+# A series video is priced from these when they are made; without mode and length the backend
+# cannot price it and every slot is skipped, so a series that looks active never posts.
+_JOB_DEFAULTS = {"mode": "lite", "format": "auto", "resolution": "720p"}
+
+
+def _check_timezone(timezone: str | None) -> None:
+    if timezone is None:
+        return
+    try:
+        ZoneInfo(timezone.strip())
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ToolError(
+            f"Unknown timezone {timezone!r}. Use an IANA name like 'America/New_York' or "
+            "'Europe/London'; ask the user where they are if unsure."
+        ) from None
+
+
+def _check_ends_at(ends_at: datetime | None) -> None:
+    if ends_at is not None and ends_at <= datetime.now(UTC):
+        raise ToolError("ends_at is in the past. Ask the user for a future end date, or omit it to run until stopped.")
+
+
+def _check_length(defaults: dict[str, Any]) -> None:
+    if not defaults.get("total_length"):
+        raise ToolError(
+            "job_defaults.total_length is required: the length in seconds of each video. "
+            "Offer the user lengths from get_video_options(format=...)."
+        )
+
+
+async def _priced_defaults(backend: BackendClient, defaults: dict[str, Any], theme: str | None) -> None:
+    """Price one video with these settings now, so bad settings fail here, not silently later."""
+    await _api(backend, "GET", "/api/resolve", params=_optional_params(
+        mode=defaults.get("mode"),
+        total_length=defaults.get("total_length"),
+        format=defaults.get("format"),
+        resolution=defaults.get("resolution"),
+        audio_mode=defaults.get("audio_mode"),
+        niche=theme,
+    ))
+
 
 def _workflow_create_body(
     *,
@@ -190,6 +236,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
         title="Create Autopilot series",
         annotations=WRITE,
+        meta=ASK_EVERY_TIME,
         structured_output=True,
     )
     async def create_series(
@@ -226,14 +273,24 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             ))] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Start an Autopilot series that makes and posts a new video on a schedule.
+        """Use when the user has approved starting an Autopilot series that makes and posts a
+        new video on a schedule. Each video spends credits when it is made.
 
-        Before calling, gather the choices step by step (theme, format, days, times and
-        timezone, accounts from list_connections, visibility, end date), quote the price per
-        video with get_video_price, show the summary and get explicit approval. Each video
-        spends credits when it is made.
+        Before calling, gather the choices one at a time (theme, format, video length, days,
+        times and timezone, accounts from list_connections, visibility, end date), quote one
+        video with get_video_price, and show a summary with videos per week and credits per
+        week. job_defaults must include total_length; mode, format and resolution default to
+        lite, auto and 720p. Never assume a timezone: ask.
+        Example: "post a space fact every weekday at 9am and 6pm on my channel" ->
+        days_of_week=[0,1,2,3,4], times_of_day=["09:00","18:00"], timezone asked
+        ("Europe/London"), job_defaults={"total_length": 30}; summary "10 videos a week x 18
+        credits = 180 credits a week", then create_series(..., confirm=true).
+        Example: "every morning" -> ask for the time, offering 07:00, 09:00 (recommended) or 11:00.
         """
-        _require_confirmation(confirm, "Creating an Autopilot series")
+        _check_timezone(timezone)
+        _check_ends_at(ends_at)
+        job_defaults = {**_JOB_DEFAULTS, **(job_defaults or {})}
+        _check_length(job_defaults)
         body = _workflow_create_body(
             name=name,
             theme=theme,
@@ -252,6 +309,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             post_tags=post_tags,
             job_defaults=job_defaults,
         )
+        _require_confirmation(confirm, "Creating an Autopilot series")
+        await _priced_defaults(backend, job_defaults, theme)
         return _dict_result(await _api(backend, "POST", "/api/workflows", body=body))
 
     @server.tool(
@@ -282,12 +341,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         job_defaults: Annotated[dict[str, Any] | None, Field(description="Replacement video settings, same keys as create_series.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Change an Autopilot series after the user reviews the change.
+        """Use when the user wants to change an Autopilot series, after they review the change.
+        job_defaults is merged into the current video settings, so pass only what changes.
 
         Changing the cadence or generation brief causes the backend to drop planned slots and
         re-plan them. Show that consequence before calling. Omitted fields stay unchanged.
         """
-        _require_confirmation(confirm, "Updating an Autopilot series")
+        _check_timezone(timezone)
+        _check_ends_at(ends_at)
         body = _optional_params(
             name=_bounded_text(name, "name", 120),
             theme=_bounded_text(theme, "theme", 2000),
@@ -308,6 +369,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         )
         if not body:
             raise ToolError("Provide at least one series field to update.")
+        _require_confirmation(confirm, "Updating an Autopilot series")
+        if job_defaults is not None:
+            # The backend replaces job_defaults whole; merge so a partial change keeps the rest.
+            current = _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
+            body["job_defaults"] = {**_JOB_DEFAULTS, **(current.get("job_defaults") or {}), **job_defaults}
+            await _priced_defaults(backend, body["job_defaults"], theme or current.get("theme"))
         return _dict_result(await _api(backend, "PATCH", f"/api/workflows/{series_id}", body=body))
 
     @server.tool(
@@ -348,10 +415,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
         title="Delete Autopilot series",
         annotations=WRITE,
+        meta=ASK_EVERY_TIME,
         structured_output=True,
     )
     async def delete_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Delete a series and its schedule. Published posts stay in list_posts."""
+        """Delete a series and its schedule; its posts still waiting to go out are cancelled.
+        Published posts stay in list_posts. To keep the history visible, stop_series instead."""
         _require_confirmation(confirm, "Deleting an Autopilot series")
         return _dict_result(await _api(backend, "DELETE", f"/api/workflows/{series_id}"))
 

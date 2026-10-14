@@ -415,7 +415,7 @@ def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
 WRITE_ARGS = {
     "create_series": {
         "name": "n", "theme": "theme", "connection_ids": [UUID0], "timezone": "UTC",
-        "days_of_week": [0], "times_of_day": ["09:00"],
+        "days_of_week": [0], "times_of_day": ["09:00"], "job_defaults": {"total_length": 15},
     },
     "update_series": {"series_id": UUID0, "name": "x"},
     "pause_series": {"series_id": UUID0},
@@ -463,8 +463,8 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
         httpx.delete(f"{stack['backend']}/__calls")
         result = call(stack, name, {**WRITE_ARGS[name], "confirm": True})
         assert not result.is_error, (name, text(result))
-        sent = backend_calls(stack)
-        assert [(c["method"], c["path"]) for c in sent] == [(method, path)], name
+        writes = [(c["method"], c["path"]) for c in backend_calls(stack) if c["method"] != "GET"]
+        assert writes == [(method, path)], name  # pre-flight reads are fine; exactly one write
 
 
 # ---------------------------------------------------------------- argument edge cases
@@ -493,7 +493,9 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
         ("resume_series", {"series_id": UUID0, "ends_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
         ("create_series", {**WRITE_ARGS["create_series"], "times_of_day": ["25:00"], "confirm": True}, "HH:MM"),
         ("create_series", {**WRITE_ARGS["create_series"], "days_of_week": [7], "confirm": True}, ""),
-        ("create_series", {**WRITE_ARGS["create_series"], "times_of_day": ["09:00", "09:00"], "confirm": True}, "HH:MM"),
+        ("create_series", {**WRITE_ARGS["create_series"], "timezone": "PST", "confirm": True}, "IANA"),
+        ("create_series", {**WRITE_ARGS["create_series"], "job_defaults": {"format": "pov"}, "confirm": True}, "total_length"),
+        ("create_series", {**WRITE_ARGS["create_series"], "ends_at": "2020-01-01T00:00:00Z", "confirm": True}, "past"),
         ("update_series", {"series_id": UUID0, "confirm": True}, "at least one"),
         ("update_video_details", {"job_id": UUID0, "confirm": True}, "at least one"),
         ("control_series_slot", {"slot_id": UUID0, "action": "skip", "suggested_changes": "x", "confirm": True}, "regenerate_idea"),
@@ -525,7 +527,8 @@ def test_read_filters_still_accept_naive_updated_since(stack):
 
 def test_duplicate_connection_ids_are_deduplicated(stack):
     call(stack, "publish_video", {"job_id": UUID0, "connection_ids": [UUID0, UUID0], "confirm": True})
-    assert backend_calls(stack)[0]["body"]["connection_ids"] == [UUID0]
+    post = next(c for c in backend_calls(stack) if c["method"] == "POST")
+    assert post["body"]["connection_ids"] == [UUID0]
 
 
 # ---------------------------------------------------------------- backend failure edge cases
@@ -534,7 +537,7 @@ def test_duplicate_connection_ids_are_deduplicated(stack):
 def test_insufficient_credits_message_is_passed_through(stack):
     result = call(stack, "create_video", {"niche": "x", "total_length": 15, "idempotency_key": "p", "confirm": True}, token="other-token")
     # other-token has 5 credits, job costs 10
-    assert result.is_error and "Not enough credits" in text(result)
+    assert result.is_error and "need 10, have 5." in text(result) and "get_credits" in text(result)
 
 
 def test_backend_500_detail_is_sanitised(stack):
@@ -639,9 +642,11 @@ def test_backend_outage_returns_503_not_a_crash(stack):
             "MCP_BRIDGE_SECRET": BRIDGE_SECRET, "MCP_TEST_PUBLIC_JWK": json.dumps(TEST_JWK)}, port)
 
 
-def test_rate_limit_trips_per_client_and_health_stays_open(stack):
+def test_rate_limit_trips_per_user_and_health_stays_open(stack):
     codes = [_post(stack, {"Authorization": "Bearer good-token"}, base="limited").status_code for _ in range(6)]
     assert codes[:3] == [200, 200, 200] and set(codes[3:]) == {429}
+    # Buckets are per user: hosted clients share IPs, so one user must not lock out another.
+    assert _post(stack, {"Authorization": "Bearer other-token"}, base="limited").status_code == 200
     assert httpx.get(f"{stack['limited']}/health/live").status_code == 200
 
 

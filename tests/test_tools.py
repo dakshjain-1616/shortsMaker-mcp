@@ -210,7 +210,8 @@ def test_create_workflow_validates_and_forwards_confirmed_schedule():
                 [UUID(int=1)],
                 "UTC",
                 [0, 2],
-                ["09:00", "17:30"],
+                ["09:00", "17:30", "09:00"],
+                job_defaults={"total_length": 30},
                 confirm=True,
             )
         )
@@ -218,7 +219,14 @@ def test_create_workflow_validates_and_forwards_confirmed_schedule():
         _principal.reset(context)
 
     assert result == {"id": "workflow-1", "status": "active"}
-    backend.request.assert_awaited_once_with(
+    # The video settings are priced first, so settings the backend cannot price fail now.
+    resolve = backend.request.await_args_list[0]
+    assert resolve.args[:2] == ("GET", "/api/resolve")
+    assert resolve.kwargs["params"] == {
+        "mode": "lite", "total_length": 30, "format": "auto", "resolution": "720p",
+        "niche": "Ocean facts for short-form videos",
+    }
+    backend.request.assert_awaited_with(
         "POST",
         "/api/workflows",
         "bridge-token",
@@ -234,6 +242,7 @@ def test_create_workflow_validates_and_forwards_confirmed_schedule():
             "times_of_day": ["09:00", "17:30"],
             "lead_minutes": 360,
             "grace_minutes": 360,
+            "job_defaults": {"mode": "lite", "format": "auto", "resolution": "720p", "total_length": 30},
         },
     )
 
@@ -309,6 +318,7 @@ def test_persisted_diagnostics_are_hidden_but_intended_urls_survive():
     assert result['authorization_url'] == value['authorization_url']
     assert result['empty'] == value['empty']
     assert value['posts'][0]['last_error'].endswith('SECRET')
+    assert result['posts'][0]['last_error'] == 'HTTP error [link]'
 
 
 @pytest.mark.parametrize('status', [400, 401, 402, 403, 404, 409, 422])
@@ -317,6 +327,21 @@ def test_backend_error_diagnostics_cannot_disclose_internal_requests(status):
     diagnostic = 'HTTP error https://10.0.0.5/engine/resolve?access_token=SECRET'
     message = str(_common._backend_error(BackendAPIError(status, diagnostic)))
     assert 'SECRET' not in message and '10.0.0.5' not in message and '/engine/' not in message
+
+
+def test_backend_sentences_reach_the_model_with_a_next_step():
+    from shortsmaker_mcp.backend_client import BackendAPIError, BackendUnavailable
+    credits = str(_common._backend_error(BackendAPIError(402, "Not enough credits: this video needs 40, you have 12.")))
+    assert "needs 40, you have 12" in credits and "get_credits" in credits
+    timezone = str(_common._backend_error(BackendAPIError(422, "Unknown timezone: 'PST'.")))
+    assert timezone == "Unknown timezone: 'PST'."
+    # 403 here means a route the connector may not use, not a user permission problem.
+    assert "website" in str(_common._backend_error(BackendAPIError(403, "MCP access is not allowed")))
+    # A write that timed out may have happened, so the model must check before retrying.
+    assert "SAME" in str(_common._backend_error(BackendUnavailable(), write=True))
+    # Product-written reasons stay readable; a video's engine error does not.
+    shown = _common._public_result({"last_error": "Paused. Add credits to resume.", "error": "engine trace"})
+    assert shown["last_error"] == "Paused. Add credits to resume." and "engine" not in shown["error"]
 
 
 def test_videos_list_in_progress_first_and_hide_failures_by_default():
@@ -354,3 +379,49 @@ def test_series_list_running_first_and_ended_series_count_as_stopped():
     stopped = workflows._running_first([dict(s) for s in series], "stopped")
     assert [s["id"] for s in stopped["series"]] == ["stopped", "ended"]  # newest first
     assert all(s["status"] == "stopped" for s in stopped["series"])
+
+
+def test_publish_refuses_repeat_posts_and_unchosen_tiktok_privacy():
+    from shortsmaker_mcp.tools import publishing
+    yt, tt = str(UUID(int=1)), str(UUID(int=2))
+    backend = Mock()
+    backend.bridge_token.return_value = "bridge-token"
+    backend.request = AsyncMock(side_effect=lambda method, path, token, **kw: {
+        "/api/connections": [
+            {"id": yt, "platform": "youtube", "account_name": "MyChannel"},
+            {"id": tt, "platform": "tiktok", "account_name": "me"},
+        ],
+        "/api/posts": [{"connection_id": yt, "status": "published"}],
+    }[path])
+    check = publishing._check_destinations
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        with pytest.raises(ToolError, match="TikTok requires"):
+            asyncio.run(check(backend, UUID(int=9), {tt}, None, False))
+        with pytest.raises(ToolError, match=r"MyChannel \(youtube\): published"):
+            asyncio.run(check(backend, UUID(int=9), {yt}, None, False))
+        asyncio.run(check(backend, UUID(int=9), {yt}, None, True))  # the user asked to repost
+        asyncio.run(check(backend, UUID(int=9), {tt}, "private", False))
+    finally:
+        _principal.reset(context)
+
+
+def test_series_update_merges_video_settings_instead_of_replacing_them():
+    server, backend = _registered_tools()
+    backend.request.side_effect = lambda method, path, token, **kw: (
+        {"theme": "space", "job_defaults": {"total_length": 30, "audio_mode": "narration"}}
+        if method == "GET" and path.startswith("/api/workflows/") else {"ok": True}
+    )
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        asyncio.run(server._tool_manager._tools["update_series"].fn(
+            UUID(int=1), job_defaults={"format": "pov"}, confirm=True,
+        ))
+    finally:
+        _principal.reset(context)
+
+    patch = backend.request.await_args_list[-1]
+    assert patch.args[:2] == ("PATCH", f"/api/workflows/{UUID(int=1)}")
+    assert patch.kwargs["body"]["job_defaults"] == {
+        "mode": "lite", "format": "pov", "resolution": "720p", "total_length": 30, "audio_mode": "narration",
+    }

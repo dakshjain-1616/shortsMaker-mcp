@@ -95,6 +95,9 @@ class BackendClient:
 
         if not response.is_success:
             detail = result.get("detail") if isinstance(result, dict) else None
+            if isinstance(detail, list):
+                # FastAPI validation errors: a list of {"loc": [...], "msg": "..."}.
+                detail = "; ".join(str(item.get("msg")) for item in detail if isinstance(item, dict)) or None
             message = detail if isinstance(detail, str) else f"Request failed ({response.status_code})."
             raise BackendAPIError(response.status_code, message[:500])
         return result
