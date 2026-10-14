@@ -27,6 +27,7 @@ from ._common import (
     _dict_result,
     _optional_params,
     _require_confirmation,
+    _with_next,
 )
 from .gallery import GALLERY_META, shown_as_gallery
 
@@ -132,6 +133,40 @@ def _strip_previews(value: Any) -> Any:
     return value
 
 
+_CONTROL_NEXT = {
+    "cancel": "Cancel requested; the held credits are refunded once it stops. Confirm with get_video when the user asks.",
+    "pause": "Pause requested; the credits stay held. control_video(action='retry') resumes it for free.",
+    "retry": "Requeued, not ready. Check with get_video when the user asks; do not poll in a loop.",
+}
+
+
+def _ids(options: Any) -> set[str]:
+    """Ids from a config list that mixes plain strings and {"id": ...} objects."""
+    if not isinstance(options, list):
+        return set()
+    return {str(o.get("id")) if isinstance(o, dict) else str(o) for o in options}
+
+
+def _check_choices(config: Any, body: dict[str, Any]) -> None:
+    """Refuse a voice, music track or style the engine does not offer, before credits are held.
+    A config without a list for one of them (older engine) skips that check."""
+    config = config if isinstance(config, dict) else {}
+    audio = config.get("audio") if isinstance(config.get("audio"), dict) else {}
+    by_format = (config.get("styles_by_format") or {}).get(body.get("format"))
+    styles = by_format.get("available") if isinstance(by_format, dict) else config.get("styles")
+    for key, options in (
+        ("narrator_voice", audio.get("voices")),
+        ("music_track", audio.get("music_tracks")),
+        ("style", styles),
+    ):
+        valid = _ids(options)
+        if body.get(key) and valid and body[key] not in valid:
+            raise ToolError(
+                f"{key} {body[key]!r} is not offered. Choose one of: {', '.join(sorted(valid)[:20])}. "
+                "Nothing was charged."
+            )
+
+
 # The web app's dashboard order (app/lib/settled.ts): videos still being made first.
 _STATUS_ORDER = {"processing": 0, "pending": 1, "paused": 2, "ready": 3, "complete": 4, "failed": 5, "cancelled": 6}
 _HIDDEN_BY_DEFAULT = {"failed", "cancelled"}
@@ -176,9 +211,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         formats, styles per format, voices, languages, music, modes, resolutions, and the valid
         lengths for one format. Read-only; spends nothing.
 
-        Ask one choice at a time with 2-4 options (label plus a short description) and a
-        recommended default; never paste the whole catalogue. Lengths depend on the format, so
-        call again after the user picks one.
+        Do: ask one choice at a time with 2-4 options (label plus a short description) and a
+        recommended default. Call again with format=... after the user picks one: lengths
+        depend on the format.
+        Don't: paste the whole catalogue, or invent ids (voices, styles, music) that are not here.
+        Returns: ``config`` (formats, styles_by_format, audio.voices, audio.music_tracks, ...)
+        and ``lengths`` for the given format. Pass ids exactly as returned.
         Example: "what kinds of videos can you make?" -> get_video_options(), then offer the 3-4
         formats that fit their topic plus Auto, one short line each.
         Example: user picks the pov format -> get_video_options(format="pov", niche=topic) and
@@ -214,13 +252,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         workflow: Annotated[str | None, Field(max_length=64, description="Optional workflow name.")] = None,
         niche: Annotated[str | None, Field(max_length=10_000, description="The topic; lets auto pick the real format.")] = None,
     ) -> dict[str, Any]:
-        """Use when the user wants to know what a video costs, before making it.
+        """Use when the user wants to know what a video costs, before making it. Never holds credits.
 
-        Returns the settings the video will really use, ``estimated_credits``, the user's
-        ``balance`` and ``can_afford``. Pass the topic as ``niche`` so Auto resolves to the real
-        format and price. If can_afford is false, do not ask for approval: show the price and
-        balance and give the billing link from the server instructions.
-        The ``credits_cost`` that create_video returns is the exact charge. Never holds credits.
+        Do: pass the topic as ``niche`` so Auto resolves to the real format and price, and use
+        the same settings you will pass to create_video.
+        Don't: ask for approval when ``can_afford`` is false; show the price, the balance and
+        the billing link from the server instructions instead.
+        Returns: the settings the video will really use, ``estimated_credits``, the user's
+        ``balance`` and ``can_afford``. The ``credits_cost`` create_video returns is the exact charge.
         """
         params = _resolve_params(
             mode=mode,
@@ -256,11 +295,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Use when the user wants to see their videos or find one ("the cooking one").
         Videos still being made come first, then the newest finished ones.
 
-        Failed and cancelled videos are hidden by default and only counted in ``hidden``;
-        mention that count in one short line, and list them only if the user asks. When
-        ``next_offset`` is not null, more videos exist: fetch them only if the user wants more.
-        Covers the 200 most recent videos. With ``updated_since`` the list is a change feed in
-        oldest-change-first order; advance by the last video's ``updated_at``.
+        Do: mention the ``hidden`` count (failed and cancelled) in one short line; when several
+        match a query, ask which one. Fetch ``next_offset`` only if the user wants more.
+        Don't: call it in a loop to watch progress, or list hidden videos unless asked.
+        Returns: ``videos`` (id, status, progress_pct, title, links when ready), ``total``,
+        ``hidden``, ``next_offset``. Covers the 200 most recent videos. With ``updated_since``
+        it is a change feed, oldest change first; advance by the last video's ``updated_at``.
         Example: "show my last video" -> list_videos(show="all", limit=1); if it failed, say so
         and offer a retry.
         Example: "post the cooking one" -> list_videos(query="cooking"); if several match, ask
@@ -302,8 +342,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def get_video(job_id: JobId, ctx: Context | None = None) -> dict[str, Any]:
-        """Read one video: status, progress while it is being made, and its video and thumbnail
-        links once ready. Links are temporary; read the video again rather than reusing old ones."""
+        """Use when the user asks about one video: is it ready, how far along, why it failed, or
+        its link.
+
+        Do: report ``status`` as-is. Only "ready" or "complete" with ``video_url`` means done;
+        pending, queued or processing means still being made (give ``progress_pct``).
+        Don't: poll in a loop, or reuse an old video_url: links are temporary, read it again.
+        Returns: id, status, progress_pct, active_stage, credits_cost, title, video_url,
+        thumbnail_urls; a failed video has an ``error`` sentence to pass on.
+        """
         result = await _api(backend, "GET", f"/api/jobs/{job_id}")
         return {**_job_summary(result), "shown_as_gallery": shown_as_gallery(ctx)}
 
@@ -329,12 +376,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     ) -> dict[str, Any]:
         """Use when the user has approved making one video. This holds credits.
 
-        Before calling: gather the choices one at a time (topic, format, length, sound and
-        voice, style), quote it with get_video_price, show a one-line summary with
-        ``estimated_credits`` and the balance, and get explicit approval. The exact charge comes
-        back as ``credits_cost``. The result means queued, not finished: a video takes a few
-        minutes. Tell the user, and check with get_video when they ask; do not poll in a loop.
-        For several videos, quote the total first and use a different idempotency_key for each.
+        Do: gather the choices one at a time (topic, format, length, sound and voice, style),
+        quote with get_video_price, show a one-line summary with ``estimated_credits`` and the
+        balance, and get explicit approval. For several videos, quote the total first and use a
+        NEW idempotency_key for each.
+        Don't: say the video is ready, poll in a loop, or pass voice/style/music ids that
+        get_video_options did not return (they are refused here before any charge).
+        Returns: id, status ("queued"/"pending" = accepted, NOT finished; a video takes a few
+        minutes), ``credits_cost`` (the exact charge) and ``next_step``.
         Example: "make a 30s video about the Roman empire with a deep male voice" ->
         get_video_options, get_video_price(niche, total_length=30, audio_mode="narration"),
         show "30s, narrated, voice Atlas, 18 credits (you have 120)", and on "yes" ->
@@ -355,6 +404,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             music_track=music_track,
             idempotency_key=idempotency_key,
         )
+        if style or narrator_voice or music_track:
+            _check_choices(await _api(backend, "GET", "/api/config"), body)
         _require_confirmation(confirm, "Video creation")
         result = await _api(backend, "POST", "/api/jobs", body=body)
         if not isinstance(result, dict):
@@ -365,7 +416,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 f"This idempotency_key was already used for another video ({result.get('niche')!r}, "
                 f"id {result.get('id')}); nothing new was made. Use a new key for a new video."
             )
-        return _job_summary(result)
+        return _with_next(
+            _job_summary(result),
+            "Queued, not ready: a video takes a few minutes. Tell the user, and check with "
+            "get_video when they ask; do not poll in a loop.",
+        )
 
     @server.tool(
         title="Cancel, pause or retry a video",
@@ -382,14 +437,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         cancel: stops it and refunds the held credits ("cancelling" means the refund lands once
         it stops). pause: stops it but keeps the hold so retry resumes it without paying again.
         retry: resumes a paused video for free, but re-makes a failed or cancelled one for its
-        full price again, so say that price (credits_cost from get_video) before asking.
-        A ready video cannot be cancelled or paused.
+        full price again.
+        Do: read it with get_video first; for a retry of a failed or cancelled one, say the
+        price (credits_cost) before asking.
+        Don't: cancel or pause a ready video (it is refused), or retry in a loop.
+        Returns: the new status plus ``next_step``.
         Example: "retry the failed one" -> get_video shows failed, credits_cost 18 -> "Retrying
         charges 18 credits again. Go ahead?" -> control_video(job_id, "retry", confirm=true).
         """
         _require_confirmation(confirm, f"Video job {action}")
         try:
-            return _dict_result(await _api(backend, "POST", f"/api/jobs/{job_id}/{action}"))
+            result = await _api(backend, "POST", f"/api/jobs/{job_id}/{action}")
+            return _with_next(result, _CONTROL_NEXT[action])
         except ToolError:
             if action == "retry":
                 raise
@@ -415,10 +474,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         ] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Update owned video metadata; published YouTube metadata may also be changed.
+        """Use when the user wants to change a video's title, description, tags or YouTube
+        visibility. Free, but a write: it may also change an already published YouTube video.
 
-        This is a write even though it does not spend credits. Ask the user to review the exact
-        fields first and set confirm=true only after approval.
+        Do: show the exact new values and get approval before confirm=true.
+        Don't: send fields the user did not ask to change (tags replace the whole list).
+        Returns: the updated video.
         """
         _require_confirmation(confirm, "Video metadata update")
         body = _optional_params(

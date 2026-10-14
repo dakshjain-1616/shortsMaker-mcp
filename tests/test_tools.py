@@ -152,6 +152,7 @@ def test_create_video_forwards_confirmed_idempotent_request():
     finally:
         _principal.reset(context)
 
+    assert result.pop("next_step").startswith("Queued, not ready")
     assert result == {"id": "job-1", "status": "queued", "credits_cost": 4}
     backend.request.assert_awaited_once_with(
         "POST",
@@ -218,6 +219,7 @@ def test_create_workflow_validates_and_forwards_confirmed_schedule():
     finally:
         _principal.reset(context)
 
+    assert result.pop("next_step").startswith("Series created")
     assert result == {"id": "workflow-1", "status": "active"}
     # The video settings are priced first, so settings the backend cannot price fail now.
     resolve = backend.request.await_args_list[0]
