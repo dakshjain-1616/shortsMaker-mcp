@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from mcp import Client
+from mcp.client.extension import advertise
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import Implementation
@@ -133,7 +135,7 @@ def backend_calls(stack) -> list[dict]:
     return [c for c in httpx.get(f"{stack['backend']}/__calls").json() if c["path"] != "/api/features"]
 
 
-def run(stack, coro_fn, token="good-token", base="mcp", path="/mcp/"):
+def run(stack, coro_fn, token="good-token", base="mcp", path="/mcp/", extensions=None):
     async def go():
         async with httpx2.AsyncClient(
             headers={"Authorization": f"Bearer {oauth_token(stack, token, base)}"}, trust_env=False
@@ -141,6 +143,7 @@ def run(stack, coro_fn, token="good-token", base="mcp", path="/mcp/"):
             async with Client(
                 streamable_http_client(f"{stack[base]}{path}", http_client=http),
                 client_info=Implementation(name="e2e", version="1"),
+                extensions=extensions,
             ) as client:
                 return await coro_fn(client)
 
@@ -163,8 +166,9 @@ def test_tool_and_prompt_catalogue(stack):
     prompts = run(stack, lambda c: c.list_prompts()).prompts
     names = {t.name for t in tools}
 
-    assert len(tools) == 29 and len(prompts) == 3
-    assert all(n.startswith("shortsmaker_") for n in names)
+    assert len(tools) == 29 and len(prompts) == 4
+    # Clients already group tools under the server name, so names are bare snake_case verbs.
+    assert all(re.fullmatch(r"[a-z]+(_[a-z]+)+", n) and len(n) <= 64 for n in names), names
     for tool in tools:
         assert tool.annotations is not None, tool.name
         assert tool.output_schema is not None, tool.name
@@ -178,7 +182,7 @@ def test_modern_protocol_discovers_and_calls_a_read_tool(stack, path):
         assert client.protocol_version == "2026-07-28"
         assert client.session.discover_result is not None
         assert len((await client.list_tools()).tools) == 29
-        result = await client.call_tool("shortsmaker_get_credit_status", {})
+        result = await client.call_tool("get_credits", {})
         assert result.structured_content == {"balance": 100}
 
     run(stack, verify, path=path)
@@ -197,7 +201,7 @@ def test_initialize_and_tools_work_across_separate_instances(stack):
     assert "mcp-session-id" not in listed.headers
     called = httpx.post(f"{stack['replica']}/mcp/", headers=headers, json={
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": {"name": "shortsmaker_get_credit_status", "arguments": {}}})
+        "params": {"name": "get_credits", "arguments": {}}})
     assert called.status_code == 200
     assert called.json()["result"]["structuredContent"] == {"balance": 100}
     assert httpx.get(f"{stack['replica']}/dashboard").status_code == 404
@@ -211,7 +215,7 @@ def test_stateless_requests_use_each_tokens_identity_and_scopes(stack):
             **MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25",
             "Authorization": f"Bearer {oauth_token(stack, label)}"}, json={
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "shortsmaker_get_credit_status", "arguments": {}}})
+                "params": {"name": "get_credits", "arguments": {}}})
         assert response.status_code == 200
         assert response.json()["result"]["structuredContent"] == {"balance": expected_balance}
     assert [entry["user"] for entry in backend_calls(stack)] == ["user-a", "user-b", "user-b"]
@@ -220,36 +224,77 @@ def test_stateless_requests_use_each_tokens_identity_and_scopes(stack):
         **MCP_HEADERS, "MCP-Protocol-Version": "2025-11-25",
         "Authorization": f"Bearer {oauth_token(stack, scope='mcp:read')}"}, json={
             "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-                "name": "shortsmaker_pause_workflow", "arguments": {"workflow_id": UUID0, "confirm": True}}})
+                "name": "pause_series", "arguments": {"series_id": UUID0, "confirm": True}}})
     assert response.status_code == 200 and response.json()["result"]["isError"] is True
     assert len(backend_calls(stack)) == 3
 
 
 def test_prompts_render_and_reject_bad_arguments(stack):
-    result = run(stack, lambda c: c.get_prompt("shortsmaker_create_video_workflow", {"niche": "space", "total_length": "15"}))
-    assert "confirm" in result.messages[0].content.text.lower()
+    result = run(stack, lambda c: c.get_prompt("new_video", {"topic": "space"}))
+    assert "confirm" in result.messages[0].content.text.lower() and "'space'" in result.messages[0].content.text
+    # Slash commands are often run with no arguments; the prompt then asks for the topic.
+    bare = run(stack, lambda c: c.get_prompt("new_series", {}))
+    assert "what the series should be about" in bare.messages[0].content.text
     with pytest.RaisesGroup(MCPError, flatten_subgroups=True):
-        run(stack, lambda c: c.get_prompt("shortsmaker_publish_video_workflow", {"job_id": "not-a-uuid"}))
+        run(stack, lambda c: c.get_prompt("share_video", {"job_id": "not-a-uuid"}))
+
+
+# ---------------------------------------------------------------- branding and gallery
+
+GALLERY_URI = "ui://faceless-video-maker/gallery.html"
+APPS_CLIENT = [advertise("io.modelcontextprotocol/ui", {"mimeTypes": ["text/html;profile=mcp-app"]})]
+
+
+def test_server_identity_carries_brand_and_icons(stack):
+    headers = {**MCP_HEADERS, "Authorization": f"Bearer {oauth_token(stack)}"}
+    info = httpx.post(f"{stack['mcp']}/mcp/", headers=headers, json=INIT).json()["result"]["serverInfo"]
+    assert info["title"] == "Faceless Video Maker"
+    assert info["websiteUrl"] == "https://facelessvideomaker.ai"
+    icon_urls = [icon["src"] for icon in info["icons"]]
+    assert all(url.startswith("http") for url in icon_urls)
+    for url in icon_urls:
+        # The icons are served by this service itself, so they work before the website ships.
+        path = "/" + url.split("/", 3)[3]
+        response = httpx.get(f"{stack['mcp']}{path}")
+        assert response.status_code == 200 and response.headers["content-type"].startswith("image/")
+
+
+def test_gallery_is_linked_from_list_tools_and_served(stack):
+    tools = {t.name: t for t in run(stack, lambda c: c.list_tools()).tools}
+    for name in ("list_videos", "get_video", "list_series"):
+        assert tools[name].meta["ui"]["resourceUri"] == GALLERY_URI, name
+        # The OAuth middleware still decorates the gallery tools.
+        assert "securitySchemes" in tools[name].meta, name
+
+    page = run(stack, lambda c: c.read_resource(GALLERY_URI)).contents[0]
+    assert page.mime_type == "text/html;profile=mcp-app"
+    assert "ui/initialize" in page.text and ".innerHTML" not in page.text  # titles are user content
+
+
+def test_gallery_flag_follows_client_support(stack):
+    assert call(stack, "list_videos").structured_content["shown_as_gallery"] is False
+    shown = run(stack, lambda c: c.call_tool("list_series", {}), extensions=APPS_CLIENT)
+    assert shown.structured_content["shown_as_gallery"] is True
 
 
 # ---------------------------------------------------------------- happy paths
 
 
 def test_read_tools_return_backend_data(stack):
-    assert call(stack, "shortsmaker_get_credit_status").structured_content == {"balance": 100}
-    assert call(stack, "shortsmaker_list_videos").structured_content == {
-        "videos": [], "total": 0, "offset": 0, "next_offset": None
+    assert call(stack, "get_credits").structured_content == {"balance": 100}
+    assert call(stack, "list_videos").structured_content == {
+        "videos": [], "total": 0, "hidden": {}, "offset": 0, "next_offset": None, "shown_as_gallery": False
     }
-    options = call(stack, "shortsmaker_get_video_options", {"mode": "pro", "resolution": "1080p"})
+    options = call(stack, "get_video_options", {"mode": "pro", "resolution": "1080p"})
     assert not options.is_error
     lengths = [c for c in backend_calls(stack) if c["path"] == "/api/lengths"]
-    assert lengths[0]["query"] == {"mode": "pro", "resolution": "1080p"}
+    assert lengths[0]["query"] == {"format": "auto", "mode": "pro", "resolution": "1080p"}
 
 
 def test_price_quote_includes_credits_matching_the_charge(stack):
-    quote = call(stack, "shortsmaker_resolve_video_price", {"total_length": 12}).structured_content
+    quote = call(stack, "get_video_price", {"total_length": 12}).structured_content
     assert "estimated_cost" not in quote and quote["estimated_credits"] == 10
-    job = call(stack, "shortsmaker_create_video", {"niche": "x", "total_length": 12, "idempotency_key": "q", "confirm": True}).structured_content
+    job = call(stack, "create_video", {"niche": "x", "total_length": 12, "idempotency_key": "q", "confirm": True}).structured_content
     assert job["credits_cost"] == quote["estimated_credits"]
 
 
@@ -257,59 +302,59 @@ def test_billing_changes_are_not_exposed_but_credits_can_be_read(stack):
     names = {t.name for t in run(stack, lambda c: c.list_tools()).tools}
     prompts = {p.name for p in run(stack, lambda c: c.list_prompts()).prompts}
 
-    assert {"shortsmaker_get_credit_status", "shortsmaker_get_subscription", "shortsmaker_list_subscription_plans"} <= names
+    assert {"get_credits", "get_subscription", "list_plans"} <= names
     assert not names & {
-        "shortsmaker_buy_credits",
-        "shortsmaker_start_subscription",
-        "shortsmaker_open_billing_portal",
-        "shortsmaker_cancel_subscription",
+        "buy_credits",
+        "start_subscription",
+        "open_billing_portal",
+        "cancel_subscription",
     }
-    assert "shortsmaker_billing_workflow" not in prompts
-    result = call(stack, "shortsmaker_buy_credits", {"amount_usd": 10, "confirm": True})
+    assert "billing_workflow" not in prompts
+    result = call(stack, "buy_credits", {"amount_usd": 10, "confirm": True})
     assert result.is_error and backend_calls(stack) == []
 
 
 def test_every_read_only_tool_runs_without_side_effects(stack):
     tools = run(stack, lambda c: c.list_tools()).tools
     skip_args = {
-        "shortsmaker_resolve_video_price": {"total_length": 15},
-        "shortsmaker_get_video": {"job_id": UUID0},
-        "shortsmaker_get_workflow": {"workflow_id": UUID0},
-        "shortsmaker_list_workflow_slots": {"workflow_id": UUID0},
+        "get_video_price": {"total_length": 15},
+        "get_video": {"job_id": UUID0},
+        "get_series": {"series_id": UUID0},
+        "list_series_slots": {"series_id": UUID0},
     }
     for tool in (t for t in tools if t.annotations.read_only_hint):
         result = call(stack, tool.name, skip_args.get(tool.name, {}))
         # get_video on a missing job is a clean ToolError, everything else must succeed
-        assert (not result.is_error) or tool.name == "shortsmaker_get_video", (tool.name, text(result))
+        assert (not result.is_error) or tool.name == "get_video", (tool.name, text(result))
     assert {c["method"] for c in backend_calls(stack)} == {"GET"}
 
 
 def test_create_video_end_to_end_and_summary_strips_large_fields(stack):
     created = call(
         stack,
-        "shortsmaker_create_video",
+        "create_video",
         {"niche": "  deep sea  ", "total_length": 15, "idempotency_key": "k1", "confirm": True},
     ).structured_content
-    assert created["status"] == "queued" and created["niche"] == "deep sea"
+    assert created["status"] == "pending" and created["niche"] == "deep sea"
     assert "config" not in created and "owner" not in created
-    assert call(stack, "shortsmaker_get_credit_status").structured_content == {"balance": 90}
-    fetched = call(stack, "shortsmaker_get_video", {"job_id": created["id"]}).structured_content
+    assert call(stack, "get_credits").structured_content == {"balance": 90}
+    fetched = call(stack, "get_video", {"job_id": created["id"]}).structured_content
     assert fetched["id"] == created["id"]
 
 
 def test_list_videos_pages_newest_first_with_next_offset(stack):
     for i in range(7):
-        call(stack, "shortsmaker_create_video", {"niche": f"video-{i}", "total_length": 15, "idempotency_key": f"page-{i}", "confirm": True})
+        call(stack, "create_video", {"niche": f"video-{i}", "total_length": 15, "idempotency_key": f"page-{i}", "confirm": True})
 
     def page(**args):
-        data = call(stack, "shortsmaker_list_videos", args).structured_content
+        data = call(stack, "list_videos", args).structured_content
         return [v["niche"] for v in data["videos"]], data
 
-    niches, data = page()  # default page size is 5
+    niches, data = page(limit=5)
     assert niches == [f"video-{i}" for i in (6, 5, 4, 3, 2)]
     assert data["total"] == 7 and data["next_offset"] == 5
 
-    niches, data = page(offset=data["next_offset"])
+    niches, data = page(limit=5, offset=data["next_offset"])
     assert niches == ["video-1", "video-0"] and data["next_offset"] is None
 
     niches, data = page(limit=3, offset=3)
@@ -319,17 +364,30 @@ def test_list_videos_pages_newest_first_with_next_offset(stack):
     assert niches == [] and data["next_offset"] is None
 
 
+def test_list_videos_hides_failed_videos_unless_asked(stack):
+    for niche in ("failed-early", "kept", "failed-late"):
+        call(stack, "create_video", {"niche": niche, "total_length": 15, "idempotency_key": niche, "confirm": True})
+
+    data = call(stack, "list_videos", {}).structured_content
+    assert [v["niche"] for v in data["videos"]] == ["kept"]
+    assert data["hidden"] == {"failed": 2} and data["total"] == 1
+
+    failed = call(stack, "list_videos", {"show": "failed"}).structured_content
+    assert [v["niche"] for v in failed["videos"]] == ["failed-late", "failed-early"]
+    assert failed["hidden"] == {}
+
+
 @pytest.mark.parametrize("args", [{"limit": 0}, {"limit": 51}, {"offset": -1}])
 def test_list_videos_rejects_bad_paging(stack, args):
-    assert call(stack, "shortsmaker_list_videos", args).is_error
+    assert call(stack, "list_videos", args).is_error
 
 
 def test_idempotency_key_replay_does_not_double_charge(stack):
     args = {"niche": "x", "total_length": 15, "idempotency_key": "same", "confirm": True}
-    first = call(stack, "shortsmaker_create_video", args).structured_content
-    second = call(stack, "shortsmaker_create_video", args).structured_content
+    first = call(stack, "create_video", args).structured_content
+    second = call(stack, "create_video", args).structured_content
     assert first["id"] == second["id"]
-    assert call(stack, "shortsmaker_get_credit_status").structured_content == {"balance": 90}
+    assert call(stack, "get_credits").structured_content == {"balance": 90}
 
 
 def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
@@ -337,7 +395,7 @@ def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
         async def one(token):
             async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {oauth_token(stack, token)}"}, trust_env=False) as h:
                 async with Client(streamable_http_client(f"{stack['mcp']}/mcp/", http_client=h)) as c:
-                    return [(await c.call_tool("shortsmaker_get_credit_status", {})).structured_content["balance"] for _ in range(5)]
+                    return [(await c.call_tool("get_credits", {})).structured_content["balance"] for _ in range(5)]
 
         return await asyncio.gather(*[one("good-token" if i % 2 == 0 else "other-token") for i in range(10)])
 
@@ -345,9 +403,9 @@ def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
     assert all(r == [100] * 5 for r in results[0::2])
     assert all(r == [5] * 5 for r in results[1::2])
 
-    mine = call(stack, "shortsmaker_create_video", {"niche": "mine", "total_length": 15, "idempotency_key": "iso", "confirm": True})
+    mine = call(stack, "create_video", {"niche": "mine", "total_length": 15, "idempotency_key": "iso", "confirm": True})
     job_id = mine.structured_content["id"]
-    stolen = call(stack, "shortsmaker_get_video", {"job_id": job_id}, token="other-token")
+    stolen = call(stack, "get_video", {"job_id": job_id}, token="other-token")
     assert stolen.is_error and "not found" in text(stolen).lower()
 
 
@@ -355,24 +413,24 @@ def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
 
 
 WRITE_ARGS = {
-    "shortsmaker_create_workflow": {
+    "create_series": {
         "name": "n", "theme": "theme", "connection_ids": [UUID0], "timezone": "UTC",
-        "days_of_week": [0], "times_of_day": ["09:00"],
+        "days_of_week": [0], "times_of_day": ["09:00"], "job_defaults": {"total_length": 15},
     },
-    "shortsmaker_update_workflow": {"workflow_id": UUID0, "name": "x"},
-    "shortsmaker_pause_workflow": {"workflow_id": UUID0},
-    "shortsmaker_resume_workflow": {"workflow_id": UUID0},
-    "shortsmaker_stop_workflow": {"workflow_id": UUID0},
-    "shortsmaker_delete_workflow": {"workflow_id": UUID0},
-    "shortsmaker_update_workflow_slot": {"slot_id": UUID0, "title": "t"},
-    "shortsmaker_control_workflow_slot": {"slot_id": UUID0, "action": "skip"},
-    "shortsmaker_create_video": {"niche": "x", "total_length": 15, "idempotency_key": "k"},
-    "shortsmaker_control_video": {"job_id": UUID0, "action": "cancel"},
-    "shortsmaker_update_video_metadata": {"job_id": UUID0, "title": "t"},
-    "shortsmaker_start_connection": {"platform": "youtube"},
-    "shortsmaker_disconnect": {"connection_id": UUID0},
-    "shortsmaker_publish_video": {"job_id": UUID0, "connection_ids": [UUID0]},
-    "shortsmaker_control_post": {"post_id": UUID0, "action": "cancel"},
+    "update_series": {"series_id": UUID0, "name": "x"},
+    "pause_series": {"series_id": UUID0},
+    "resume_series": {"series_id": UUID0},
+    "stop_series": {"series_id": UUID0},
+    "delete_series": {"series_id": UUID0},
+    "update_series_slot": {"slot_id": UUID0, "title": "t"},
+    "control_series_slot": {"slot_id": UUID0, "action": "skip"},
+    "create_video": {"niche": "x", "total_length": 15, "idempotency_key": "k"},
+    "control_video": {"job_id": UUID0, "action": "cancel"},
+    "update_video_details": {"job_id": UUID0, "title": "t"},
+    "connect_account": {"platform": "youtube"},
+    "disconnect_account": {"connection_id": UUID0},
+    "publish_video": {"job_id": UUID0, "connection_ids": [UUID0]},
+    "control_post": {"post_id": UUID0, "action": "cancel"},
 }
 
 
@@ -391,22 +449,22 @@ def test_every_write_tool_refuses_without_confirmation_and_never_reaches_backend
 
 def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
     expected = {
-        "shortsmaker_pause_workflow": ("POST", f"/api/workflows/{UUID0}/pause"),
-        "shortsmaker_delete_workflow": ("DELETE", f"/api/workflows/{UUID0}"),
-        "shortsmaker_control_workflow_slot": ("POST", f"/api/workflow-slots/{UUID0}/skip"),
-        "shortsmaker_control_video": ("POST", f"/api/jobs/{UUID0}/cancel"),
-        "shortsmaker_control_post": ("POST", f"/api/posts/{UUID0}/cancel"),
-        "shortsmaker_disconnect": ("DELETE", f"/api/connections/{UUID0}"),
-        "shortsmaker_start_connection": ("POST", "/api/connections/youtube/authorize"),
-        "shortsmaker_update_video_metadata": ("PATCH", f"/api/jobs/{UUID0}"),
-        "shortsmaker_publish_video": ("POST", "/api/posts"),
+        "pause_series": ("POST", f"/api/workflows/{UUID0}/pause"),
+        "delete_series": ("DELETE", f"/api/workflows/{UUID0}"),
+        "control_series_slot": ("POST", f"/api/workflow-slots/{UUID0}/skip"),
+        "control_video": ("POST", f"/api/jobs/{UUID0}/cancel"),
+        "control_post": ("POST", f"/api/posts/{UUID0}/cancel"),
+        "disconnect_account": ("DELETE", f"/api/connections/{UUID0}"),
+        "connect_account": ("POST", "/api/connections/youtube/authorize"),
+        "update_video_details": ("PATCH", f"/api/jobs/{UUID0}"),
+        "publish_video": ("POST", "/api/posts"),
     }
     for name, (method, path) in expected.items():
         httpx.delete(f"{stack['backend']}/__calls")
         result = call(stack, name, {**WRITE_ARGS[name], "confirm": True})
         assert not result.is_error, (name, text(result))
-        sent = backend_calls(stack)
-        assert [(c["method"], c["path"]) for c in sent] == [(method, path)], name
+        writes = [(c["method"], c["path"]) for c in backend_calls(stack) if c["method"] != "GET"]
+        assert writes == [(method, path)], name  # pre-flight reads are fine; exactly one write
 
 
 # ---------------------------------------------------------------- argument edge cases
@@ -415,33 +473,35 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
 @pytest.mark.parametrize(
     "tool,args,fragment",
     [
-        ("shortsmaker_resolve_video_price", {"total_length": 0}, ""),
-        ("shortsmaker_resolve_video_price", {"total_length": -1}, ""),
-        ("shortsmaker_resolve_video_price", {"total_length": 3601}, ""),
-        ("shortsmaker_resolve_video_price", {"total_length": "abc"}, ""),
-        ("shortsmaker_resolve_video_price", {"total_length": 15, "mode": "x" * 33}, ""),
-        ("shortsmaker_get_video", {"job_id": "not-a-uuid"}, ""),
-        ("shortsmaker_create_video", {"niche": "   ", "total_length": 15, "idempotency_key": "k", "confirm": True}, "required"),
-        ("shortsmaker_create_video", {"niche": "x" * 10_001, "total_length": 15, "idempotency_key": "k", "confirm": True}, ""),
-        ("shortsmaker_create_video", {"niche": "x", "total_length": 15, "idempotency_key": " ", "confirm": True}, "required"),
-        ("shortsmaker_create_video", {"niche": "x", "total_length": 15, "confirm": True}, ""),
-        ("shortsmaker_publish_video", {"job_id": UUID0, "connection_ids": [], "confirm": True}, ""),
-        ("shortsmaker_publish_video", {"job_id": UUID0, "connection_ids": [UUID0], "scheduled_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
-        ("shortsmaker_create_workflow", {**WRITE_ARGS["shortsmaker_create_workflow"], "ends_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
-        ("shortsmaker_create_workflow", {**WRITE_ARGS["shortsmaker_create_workflow"], "lead_minutes": 29, "confirm": True}, ""),
-        ("shortsmaker_create_workflow", {**WRITE_ARGS["shortsmaker_create_workflow"], "grace_minutes": 10081, "confirm": True}, ""),
-        ("shortsmaker_update_workflow_slot", {"slot_id": UUID0, "slot_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
-        ("shortsmaker_list_workflow_slots", {"workflow_id": UUID0, "from_time": "2030-01-01T12:00:00"}, "timezone"),
-        ("shortsmaker_resume_workflow", {"workflow_id": UUID0, "ends_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
-        ("shortsmaker_create_workflow", {**WRITE_ARGS["shortsmaker_create_workflow"], "times_of_day": ["25:00"], "confirm": True}, "HH:MM"),
-        ("shortsmaker_create_workflow", {**WRITE_ARGS["shortsmaker_create_workflow"], "days_of_week": [7], "confirm": True}, ""),
-        ("shortsmaker_create_workflow", {**WRITE_ARGS["shortsmaker_create_workflow"], "times_of_day": ["09:00", "09:00"], "confirm": True}, "HH:MM"),
-        ("shortsmaker_update_workflow", {"workflow_id": UUID0, "confirm": True}, "at least one"),
-        ("shortsmaker_update_video_metadata", {"job_id": UUID0, "confirm": True}, "at least one"),
-        ("shortsmaker_control_workflow_slot", {"slot_id": UUID0, "action": "skip", "suggested_changes": "x", "confirm": True}, "regenerate_idea"),
-        ("shortsmaker_control_video", {"job_id": UUID0, "action": "delete", "confirm": True}, ""),
-        ("shortsmaker_list_posts", {"status": "bogus"}, ""),
-        ("shortsmaker_does_not_exist", {}, ""),
+        ("get_video_price", {"total_length": 0}, ""),
+        ("get_video_price", {"total_length": -1}, ""),
+        ("get_video_price", {"total_length": 3601}, ""),
+        ("get_video_price", {"total_length": "abc"}, ""),
+        ("get_video_price", {"total_length": 15, "mode": "x" * 33}, ""),
+        ("get_video", {"job_id": "not-a-uuid"}, ""),
+        ("create_video", {"niche": "   ", "total_length": 15, "idempotency_key": "k", "confirm": True}, "required"),
+        ("create_video", {"niche": "x" * 10_001, "total_length": 15, "idempotency_key": "k", "confirm": True}, ""),
+        ("create_video", {"niche": "x", "total_length": 15, "idempotency_key": " ", "confirm": True}, "required"),
+        ("create_video", {"niche": "x", "total_length": 15, "confirm": True}, ""),
+        ("publish_video", {"job_id": UUID0, "connection_ids": [], "confirm": True}, ""),
+        ("publish_video", {"job_id": UUID0, "connection_ids": [UUID0], "scheduled_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
+        ("create_series", {**WRITE_ARGS["create_series"], "ends_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
+        ("create_series", {**WRITE_ARGS["create_series"], "lead_minutes": 29, "confirm": True}, ""),
+        ("create_series", {**WRITE_ARGS["create_series"], "grace_minutes": 10081, "confirm": True}, ""),
+        ("update_series_slot", {"slot_id": UUID0, "slot_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
+        ("list_series_slots", {"series_id": UUID0, "from_time": "2030-01-01T12:00:00"}, "timezone"),
+        ("resume_series", {"series_id": UUID0, "ends_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
+        ("create_series", {**WRITE_ARGS["create_series"], "times_of_day": ["25:00"], "confirm": True}, "HH:MM"),
+        ("create_series", {**WRITE_ARGS["create_series"], "days_of_week": [7], "confirm": True}, ""),
+        ("create_series", {**WRITE_ARGS["create_series"], "timezone": "PST", "confirm": True}, "IANA"),
+        ("create_series", {**WRITE_ARGS["create_series"], "job_defaults": {"format": "pov"}, "confirm": True}, "total_length"),
+        ("create_series", {**WRITE_ARGS["create_series"], "ends_at": "2020-01-01T00:00:00Z", "confirm": True}, "past"),
+        ("update_series", {"series_id": UUID0, "confirm": True}, "at least one"),
+        ("update_video_details", {"job_id": UUID0, "confirm": True}, "at least one"),
+        ("control_series_slot", {"slot_id": UUID0, "action": "skip", "suggested_changes": "x", "confirm": True}, "regenerate_idea"),
+        ("control_video", {"job_id": UUID0, "action": "delete", "confirm": True}, ""),
+        ("list_posts", {"status": "bogus"}, ""),
+        ("does_not_exist", {}, ""),
     ],
 )
 def test_invalid_arguments_are_rejected_before_the_backend(stack, tool, args, fragment):
@@ -453,7 +513,7 @@ def test_invalid_arguments_are_rejected_before_the_backend(stack, tool, args, fr
 
 def test_unicode_and_boundary_values_are_accepted(stack):
     args = {"niche": "日本語 🌊 " + "x" * 9980, "total_length": 3600, "idempotency_key": "é" * 200, "confirm": True}
-    result = call(stack, "shortsmaker_create_video", args)
+    result = call(stack, "create_video", args)
     assert not result.is_error, text(result)
     sent = backend_calls(stack)[0]["body"]
     assert sent["total_length"] == 3600 and sent["niche"].startswith("日本語 🌊")
@@ -461,32 +521,33 @@ def test_unicode_and_boundary_values_are_accepted(stack):
 
 def test_read_filters_still_accept_naive_updated_since(stack):
     # Only writes and slot windows enforce timezones; these read filters never did.
-    for tool in ("shortsmaker_list_posts", "shortsmaker_list_videos"):
+    for tool in ("list_posts", "list_videos"):
         assert not call(stack, tool, {"updated_since": "2030-01-01T12:00:00"}).is_error, tool
 
 
 def test_duplicate_connection_ids_are_deduplicated(stack):
-    call(stack, "shortsmaker_publish_video", {"job_id": UUID0, "connection_ids": [UUID0, UUID0], "confirm": True})
-    assert backend_calls(stack)[0]["body"]["connection_ids"] == [UUID0]
+    call(stack, "publish_video", {"job_id": UUID0, "connection_ids": [UUID0, UUID0], "confirm": True})
+    post = next(c for c in backend_calls(stack) if c["method"] == "POST")
+    assert post["body"]["connection_ids"] == [UUID0]
 
 
 # ---------------------------------------------------------------- backend failure edge cases
 
 
 def test_insufficient_credits_message_is_passed_through(stack):
-    result = call(stack, "shortsmaker_create_video", {"niche": "x", "total_length": 15, "idempotency_key": "p", "confirm": True}, token="other-token")
+    result = call(stack, "create_video", {"niche": "x", "total_length": 15, "idempotency_key": "p", "confirm": True}, token="other-token")
     # other-token has 5 credits, job costs 10
-    assert result.is_error and "Insufficient credits" in text(result)
+    assert result.is_error and "need 10, have 5." in text(result) and "get_credits" in text(result)
 
 
 def test_backend_500_detail_is_sanitised(stack):
-    result = call(stack, "shortsmaker_create_video", {"niche": "boom500", "total_length": 15, "idempotency_key": "b", "confirm": True})
+    result = call(stack, "create_video", {"niche": "boom500", "total_length": 15, "idempotency_key": "b", "confirm": True})
     assert result.is_error
     assert "psycopg2" not in text(result) and "10.0.0.5" not in text(result)
 
 
 def test_backend_non_json_response_is_a_clean_error(stack):
-    result = call(stack, "shortsmaker_create_video", {"niche": "badjson", "total_length": 15, "idempotency_key": "j", "confirm": True})
+    result = call(stack, "create_video", {"niche": "badjson", "total_length": 15, "idempotency_key": "j", "confirm": True})
     assert result.is_error and "<html>" not in text(result)
 
 
@@ -556,7 +617,7 @@ def test_mcp_endpoint_without_trailing_slash_does_not_redirect(stack):
 
     authorized = _post(stack, {"Authorization": "Bearer good-token"}, path="/mcp")
     assert authorized.status_code == 200
-    assert authorized.json()["result"]["serverInfo"]["name"] == "ShortsMaker"
+    assert authorized.json()["result"]["serverInfo"]["name"] == "faceless-video-maker"
 
 
 def test_rebinding_protection_rejects_foreign_host_and_origin(stack):
@@ -573,7 +634,7 @@ def test_backend_outage_returns_503_not_a_crash(stack):
     backend_proc.terminate()
     backend_proc.wait(timeout=10)
     try:
-        result = call(stack, "shortsmaker_get_credit_status")
+        result = call(stack, "get_credits")
         assert result.is_error
         assert httpx.get(f"{stack['mcp']}/health/live").status_code == 200
     finally:
@@ -581,9 +642,11 @@ def test_backend_outage_returns_503_not_a_crash(stack):
             "MCP_BRIDGE_SECRET": BRIDGE_SECRET, "MCP_TEST_PUBLIC_JWK": json.dumps(TEST_JWK)}, port)
 
 
-def test_rate_limit_trips_per_client_and_health_stays_open(stack):
+def test_rate_limit_trips_per_user_and_health_stays_open(stack):
     codes = [_post(stack, {"Authorization": "Bearer good-token"}, base="limited").status_code for _ in range(6)]
     assert codes[:3] == [200, 200, 200] and set(codes[3:]) == {429}
+    # Buckets are per user: hosted clients share IPs, so one user must not lock out another.
+    assert _post(stack, {"Authorization": "Bearer other-token"}, base="limited").status_code == 200
     assert httpx.get(f"{stack['limited']}/health/live").status_code == 200
 
 
@@ -591,7 +654,7 @@ def test_dashboard_flag_and_health(stack):
     assert httpx.get(f"{stack['mcp']}/dashboard").status_code == 200
     assert httpx.get(f"{stack['limited']}/dashboard").status_code == 404
     health = httpx.get(f"{stack['mcp']}/health/live").json()
-    assert health["status"] == "ok" and health["version"] == "0.2.0"
+    assert health["status"] == "ok" and health["version"] == "0.3.0"
 
 
 @pytest.mark.parametrize('version', ['2025-03-26', '2025-06-18', '2025-11-25'])
@@ -622,7 +685,7 @@ def test_scope_upgrade_has_tool_level_oauth_challenge_without_backend_call(stack
         'MCP-Protocol-Version': '2025-11-25',
     }, json={
         'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-        'params': {'name': 'shortsmaker_pause_workflow', 'arguments': {'workflow_id': UUID0, 'confirm': True}},
+        'params': {'name': 'pause_series', 'arguments': {'series_id': UUID0, 'confirm': True}},
     })
     assert response.status_code == 200
     result = response.json()['result']
@@ -644,8 +707,8 @@ def test_scope_denial_is_a_valid_result_for_the_official_mcp_client(stack):
                 client_info=Implementation(name="scope-e2e", version="1"),
             ) as client:
                 return await client.call_tool(
-                    "shortsmaker_pause_workflow",
-                    {"workflow_id": UUID0, "confirm": True},
+                    "pause_series",
+                    {"series_id": UUID0, "confirm": True},
                 )
 
     result = asyncio.run(check())

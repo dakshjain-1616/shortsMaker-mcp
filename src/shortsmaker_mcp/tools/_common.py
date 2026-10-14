@@ -7,6 +7,7 @@ conversation into a credit-spending or publishing action.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -27,15 +28,15 @@ Niche = Annotated[
     ),
 ]
 
-JobId = Annotated[UUID, Field(description="The ShortsMaker video job UUID.")]
+JobId = Annotated[UUID, Field(description="A video id, from list_videos or create_video.")]
 
-PostId = Annotated[UUID, Field(description="The ShortsMaker scheduled-post UUID.")]
+PostId = Annotated[UUID, Field(description="A post id, from list_posts or publish_video.")]
 
-ConnectionId = Annotated[UUID, Field(description="A connected social-account UUID.")]
+ConnectionId = Annotated[UUID, Field(description="A connected social account id, from list_connections.")]
 
-WorkflowId = Annotated[UUID, Field(description="A ShortsMaker recurring-workflow UUID.")]
+WorkflowId = Annotated[UUID, Field(description="An Autopilot series id, from list_series.")]
 
-WorkflowSlotId = Annotated[UUID, Field(description="A scheduled workflow-slot UUID.")]
+WorkflowSlotId = Annotated[UUID, Field(description="A scheduled series slot id, from list_series_slots.")]
 
 Confirm = Annotated[
     bool,
@@ -52,15 +53,20 @@ IdempotencyKey = Annotated[
     Field(
         min_length=1,
         max_length=200,
-        description="A fresh client-generated key that makes a retried create request safe.",
+        description=(
+            "A key you make up for this one video, e.g. 'rome-30s-1'. Retrying the same video "
+            "(after a timeout) uses the SAME key, which never charges twice; every different "
+            "video needs a NEW key."
+        ),
     ),
 ]
 
+# Reads only touch the signed-in user's own workspace, so they are not open-world.
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
-    openWorldHint=True,
+    openWorldHint=False,
 )
 
 WRITE = ToolAnnotations(
@@ -76,6 +82,10 @@ IDEMPOTENT_WRITE = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=True,
 )
+
+# Claude Code asks the user on every call of a tool with this hint, even in auto modes. Used on
+# the tools that spend credits, post publicly or delete. Other clients ignore it.
+ASK_EVERY_TIME = {"anthropic/requiresUserInteraction": True}
 
 def _json_default(value: Any) -> str:
     if isinstance(value, datetime):
@@ -142,23 +152,52 @@ def _dedupe_ids(connection_ids: list[UUID]) -> list[str]:
 def _dict_result(result: Any) -> dict[str, Any]:
     return result if isinstance(result, dict) else {"result": result}
 
-def _backend_error(exc: Exception) -> ToolError:
+_URL = re.compile(r"https?://\S+")
+
+# Fallbacks for when the backend gives no sentence of its own. 401/403/429/5xx always use these:
+# 401 and 403 here mean connector configuration, not something the user can fix in chat.
+_FALLBACK = {
+    401: "Faceless Video Maker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
+    402: "Not enough credits for this.",
+    403: "This action isn't available through the connector yet. The user can do it on the website (https://facelessvideomaker.ai).",
+    404: "Not found.",
+    409: "Not allowed in the item's current state.",
+    429: "Too many requests. Wait a minute before trying again; do not retry in a loop.",
+}
+# A next step for the model, added after the backend's own sentence.
+_NEXT_STEP = {
+    402: " Show the user the price and their balance (get_credits). They can top up at https://facelessvideomaker.ai; you cannot buy credits.",
+    404: " Use the matching list tool (list_videos, list_series, list_posts, list_connections) to find a valid id.",
+}
+
+
+def _public_text(text: str) -> str:
+    """Backend sentences are written for users, but strip links (signed URLs carry credentials)."""
+    return _URL.sub("[link]", text).strip()[:300]
+
+
+def _backend_error(exc: Exception, write: bool = False) -> ToolError:
     if isinstance(exc, BackendUnavailable):
-        return ToolError("ShortsMaker API is unavailable. Try again shortly.")
+        if write:
+            # A timed-out write may still have happened; blind retries could double-charge or double-post.
+            return ToolError(
+                "Faceless Video Maker did not answer in time, so this may or may not have gone through. "
+                "Check list_videos or list_posts before trying again; a create_video retry with the SAME "
+                "idempotency_key is always safe."
+            )
+        return ToolError("Faceless Video Maker is temporarily unavailable. Tell the user and try again in a minute.")
     if isinstance(exc, BackendAPIError):
-        # Upstream diagnostics can contain private URLs or credentials, even on a 4xx.
-        messages = {
-            401: "ShortsMaker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
-            402: "Insufficient credits. Check your balance and the quoted cost before retrying.",
-            403: "Your connected account does not have permission for this action.",
-            404: "The requested item was not found.",
-            409: "This action conflicts with the item's current state.",
-            429: "ShortsMaker rate limit reached. Try again shortly.",
-        }
-        if exc.status_code >= 500:
-            return ToolError("ShortsMaker could not complete that request. Try again shortly.")
-        return ToolError(messages.get(exc.status_code, "ShortsMaker rejected this request. Check the options and try again."))
-    return ToolError("ShortsMaker could not complete that request.")
+        status = exc.status_code
+        if status >= 500:
+            return ToolError("Faceless Video Maker could not complete that request. Try again shortly.")
+        if status in (401, 403, 429) or exc.detail.startswith("Request failed ("):
+            message = _FALLBACK.get(status, "Faceless Video Maker rejected this request. Check the values and try again.")
+        else:
+            message = _public_text(exc.detail)
+        if message and message[-1] not in ".!?":
+            message += "."
+        return ToolError(message + _NEXT_STEP.get(status, ""))
+    return ToolError("Faceless Video Maker could not complete that request.")
 
 def _require_confirmation(confirm: bool, action: str) -> None:
     if not confirm:
@@ -168,18 +207,23 @@ def _require_confirmation(confirm: bool, action: str) -> None:
         )
 
 def _public_result(value: Any) -> Any:
-    """Persisted failure diagnostics can contain private request URLs or provider secrets."""
+    """Hide a video job's ``error`` (engine internals) but keep ``last_error`` readable.
+
+    ``last_error`` on series, slots, posts and connections is a product sentence ("Paused. Add
+    credits to resume.") that answers the user's "why"; links are stripped as they may be signed.
+    """
     if isinstance(value, list):
         return [_public_result(item) for item in value]
     if isinstance(value, dict):
-        return {
-            key: (
-                "This operation failed. Check its status in ShortsMaker."
-                if key in {"error", "last_error"} and item
-                else _public_result(item)
-            )
-            for key, item in value.items()
-        }
+        cleaned = {}
+        for key, item in value.items():
+            if key == "error" and item:
+                cleaned[key] = "This video failed. The user can see details at https://facelessvideomaker.ai."
+            elif key == "last_error" and isinstance(item, str):
+                cleaned[key] = _public_text(item)
+            else:
+                cleaned[key] = _public_result(item)
+        return cleaned
     return value
 
 
@@ -204,4 +248,4 @@ async def _api(
         token = backend.bridge_token(principal)
         return _public_result(await backend.request(method, path, token, params=params, body=body))
     except (BackendUnavailable, BackendAPIError) as exc:
-        raise _backend_error(exc) from exc
+        raise _backend_error(exc, write=method.upper() != "GET") from exc

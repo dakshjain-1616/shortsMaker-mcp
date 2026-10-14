@@ -170,15 +170,6 @@ class BearerValidationMiddleware:
                 {"detail": "MCP OAuth is not configured."}, status_code=503
             )(scope, receive, send)
             return
-        client = scope.get("client")
-        client_key = client[0] if client else "unknown"
-        if not self.rate_limiter.allow(client_key):
-            await JSONResponse(
-                {"detail": "Too many MCP requests. Try again shortly."},
-                status_code=429,
-                headers={"Retry-After": str(int(self.rate_limiter.window_seconds))},
-            )(scope, receive, send)
-            return
         token = _bearer(scope)
         if not token:
             await JSONResponse(
@@ -199,6 +190,16 @@ class BearerValidationMiddleware:
         except (httpx.HTTPError, RuntimeError):
             await JSONResponse(
                 {"detail": "MCP authorization is temporarily unavailable."}, status_code=503
+            )(scope, receive, send)
+            return
+        # Per user, not per IP: hosted clients (Claude.ai, ChatGPT) send every user's traffic
+        # from shared addresses, so an IP key made all their users share one bucket.
+        # ponytail: in-process counts; a shared store when one user's traffic spans many instances.
+        if not self.rate_limiter.allow(principal.user_id):
+            await JSONResponse(
+                {"detail": "Too many MCP requests. Try again shortly."},
+                status_code=429,
+                headers={"Retry-After": str(int(self.rate_limiter.window_seconds))},
             )(scope, receive, send)
             return
         context = _principal.set(principal)

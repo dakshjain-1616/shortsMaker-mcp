@@ -1,2 +1,2 @@
-"""Standalone ShortsMaker MCP service."""
+"""Standalone Faceless Video Maker MCP service."""
 

@@ -35,7 +35,7 @@ class ToolAuthMiddleware:
                     challenge = (
                         f'Bearer resource_metadata="{self.metadata_url}", '
                         f'scope="{scope}", error="insufficient_scope", '
-                        'error_description="Additional ShortsMaker permission is required"'
+                        'error_description="Additional Faceless Video Maker permission is required"'
                     )
                     return CallToolResult(
                         content=[TextContent(text=f"This tool requires {scope} authorization.")],

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="FacelessVideoMaker">
+  <!-- A 9:16 frame with a play triangle in it: the shape of the thing the product makes,
+       rather than an initial. Three forms only, so it still reads at 16px. -->
+  <rect width="32" height="32" rx="7" fill="#0a0a0a"/>
+  <rect x="9.25" y="4" width="13.5" height="24" rx="2.5" fill="#e8ff4d"/>
+  <path fill="#0a0a0a" d="M12.7 11.9v8.2a.7.7 0 0 0 1.06.6l6.5-4.1a.7.7 0 0 0 0-1.2l-6.5-4.1a.7.7 0 0 0-1.06.6Z"/>
+</svg>

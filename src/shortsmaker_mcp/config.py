@@ -50,6 +50,14 @@ def _backend_url() -> str:
     return value
 
 
+def _media_origins() -> tuple[str, ...]:
+    raw = os.getenv("MCP_MEDIA_ORIGINS", "https://*.amazonaws.com")
+    origins = tuple(origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip())
+    if not origins or any(not origin.startswith("https://") for origin in origins):
+        raise RuntimeError("MCP_MEDIA_ORIGINS must be a comma-separated list of https:// origins")
+    return origins
+
+
 @dataclass(frozen=True)
 class Settings:
     backend_api_url: str
@@ -63,6 +71,8 @@ class Settings:
     oauth_issuer: str | None = None
     resource_url: str | None = None
     bridge_secret: str | None = None
+    # Where presigned thumbnails and videos live; the gallery may load media only from these.
+    media_origins: tuple[str, ...] = ("https://*.amazonaws.com",)
 
 
 def _validate_vercel(settings: Settings) -> None:
@@ -119,6 +129,7 @@ def load_settings() -> Settings:
         oauth_issuer=os.getenv("MCP_OAUTH_ISSUER", "").strip().rstrip("/") or backend_api_url,
         resource_url=resource_url,
         bridge_secret=os.getenv("MCP_BRIDGE_SECRET", "").strip() or None,
+        media_origins=_media_origins(),
     )
     if os.getenv("VERCEL") == "1":
         _validate_vercel(settings)

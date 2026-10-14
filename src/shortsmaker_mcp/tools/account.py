@@ -12,24 +12,24 @@ from ._common import READ_ONLY, _api, _dict_result
 
 def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
-        title="Get credit status",
+        title="Check my credits",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_get_credit_status() -> dict[str, Any]:
+    async def get_credits() -> dict[str, Any]:
         """Read the signed-in user's current credit balance and recent credit status.
 
         This MCP cannot buy credits or change billing. If the balance is too low, tell the user to
-        top up on the ShortsMaker website.
+        top up on the Faceless Video Maker website (https://facelessvideomaker.ai).
         """
         return _dict_result(await _api(backend, "GET", "/api/payments/credit-status"))
 
     @server.tool(
-        title="Get subscription status",
+        title="Check my subscription",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_get_subscription() -> dict[str, Any]:
+    async def get_subscription() -> dict[str, Any]:
         """Read the signed-in user's current subscription, renewal, and cancellation status."""
         return _dict_result(await _api(backend, "GET", "/api/payments/subscription"))
 
@@ -38,9 +38,9 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_list_subscription_plans() -> dict[str, Any]:
+    async def list_plans() -> dict[str, Any]:
         """List active subscription plans and prices. Read-only: plan changes and payments are done by
-        the user on the ShortsMaker website, not through this MCP."""
+        the user on the Faceless Video Maker website (https://facelessvideomaker.ai), not through this MCP."""
         return _dict_result(await _api(backend, "GET", "/api/payments/plans"))
 
     @server.tool(
@@ -48,6 +48,6 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_get_account_features() -> dict[str, Any]:
-        """Read account-level product feature flags used by the ShortsMaker composer."""
+    async def get_account_features() -> dict[str, Any]:
+        """Read account-level product feature flags used by the Faceless Video Maker composer."""
         return _dict_result(await _api(backend, "GET", "/api/features"))

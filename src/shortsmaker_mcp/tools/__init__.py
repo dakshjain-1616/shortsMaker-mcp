@@ -1,4 +1,4 @@
-"""ShortsMaker MCP tools and user-controlled workflow prompts, grouped by domain."""
+"""Faceless Video Maker MCP tools and user-controlled workflow prompts, grouped by domain."""
 
 from mcp.server import MCPServer
 

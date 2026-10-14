@@ -18,7 +18,7 @@ See the README for what each one does."""
 def main() -> None:
     argparse.ArgumentParser(
         prog="shortsmaker-mcp",
-        description="Serve the ShortsMaker MCP endpoint at /mcp/ (Streamable HTTP).",
+        description="Serve the Faceless Video Maker MCP endpoint at /mcp/ (Streamable HTTP).",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     ).parse_args()

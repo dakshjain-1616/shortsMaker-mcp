@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shortsmaker-mcp"
-version = "0.2.0"
-description = "Streamable HTTP MCP server for ShortsMaker video generation and publishing."
+version = "0.3.0"
+description = "Streamable HTTP MCP server for Faceless Video Maker video generation and publishing."
 readme = "README.md"
 requires-python = ">=3.12"
 dynamic = ["dependencies"]
@@ -25,7 +25,7 @@ dependencies = { file = ["requirements.txt"] }
 where = ["src"]
 
 [tool.setuptools.package-data]
-shortsmaker_mcp = ["static/*.html"]
+shortsmaker_mcp = ["static/*.html", "static/*.svg", "static/*.png", "static/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,7 +16,7 @@ run:
 	.venv/bin/shortsmaker-mcp
 
 docker-build:
-	docker build -t shortsmaker-mcp:0.2.0 .
+	docker build -t shortsmaker-mcp:0.3.0 .
 
 docker-up:
 	docker compose up -d --build
