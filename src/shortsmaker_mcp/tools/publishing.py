@@ -11,6 +11,7 @@ from pydantic import AwareDatetime, Field
 
 from ..backend_client import BackendClient
 from ._common import (
+    IDEMPOTENT_WRITE,
     READ_ONLY,
     WRITE,
     Confirm,
@@ -33,16 +34,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_list_connections() -> list[dict[str, Any]]:
+    async def list_connections() -> list[dict[str, Any]]:
         """List the user's connected social accounts without exposing provider access tokens."""
         return await _api(backend, "GET", "/api/connections")
 
     @server.tool(
-        title="List publishing posts",
+        title="List my posts",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_list_posts(
+    async def list_posts(
         status: Annotated[
             Literal["scheduled", "publishing", "published", "failed", "canceled"] | None,
             Field(description="Optional publishing status filter."),
@@ -50,26 +51,26 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         job_id: Annotated[UUID | None, Field(description="Optional video job filter.")] = None,
         updated_since: Annotated[datetime | None, Field(description="Optional timezone-aware update cutoff.")] = None,
     ) -> list[dict[str, Any]]:
-        """List publishing records, optionally filtered by status, video, or update time."""
+        """List the user's posts to YouTube, TikTok and Instagram and whether each is scheduled, posting, posted or failed."""
         params = _optional_params(status=status, job_id=job_id, updated_since=updated_since)
         params["summary"] = "true"
         return await _api(backend, "GET", "/api/posts", params=params)
 
     @server.tool(
-        title="Check publishing worker health",
+        title="Check posting service",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_publishing_health() -> dict[str, Any]:
+    async def check_publishing_health() -> dict[str, Any]:
         """Check whether the asynchronous publishing worker is alive and processing the user's queue."""
         return _dict_result(await _api(backend, "GET", "/api/publishing/health"))
 
     @server.tool(
-        title="Start social-account connection",
-        annotations=WRITE,
+        title="Connect a social account",
+        annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def shortsmaker_start_connection(
+    async def connect_account(
         platform: Annotated[Literal["youtube", "instagram", "tiktok"], Field(description="Provider to connect.")],
         confirm: Confirm = False,
     ) -> dict[str, Any]:
@@ -86,7 +87,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_disconnect(
+    async def disconnect_account(
         connection_id: ConnectionId,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
@@ -99,11 +100,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return _dict_result(await _api(backend, "DELETE", f"/api/connections/{connection_id}"))
 
     @server.tool(
-        title="Queue video for publishing",
+        title="Post a video",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_publish_video(
+    async def publish_video(
         job_id: JobId,
         connection_ids: Annotated[
             list[UUID],
@@ -143,11 +144,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return result if isinstance(result, list) else [_dict_result(result)]
 
     @server.tool(
-        title="Control a publishing post",
+        title="Cancel or retry a post",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_control_post(
+    async def control_post(
         post_id: PostId,
         action: Annotated[Literal["cancel", "retry"], Field(description="Post action to perform.")],
         confirm: Confirm = False,

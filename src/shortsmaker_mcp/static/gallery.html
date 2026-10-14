@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Faceless Video Maker</title>
+<style>
+  /* Brand tokens from the web app (app/globals.css). The app is dark-only; light is for light hosts. */
+  :root {
+    --bg: #0a0a0a; --surface: #111111; --surface2: #1c1c1c; --border: #2a2a2a;
+    --text: #f0f0f0; --muted: #b5b5b5; --faint: #8a8a8a;
+    --accent: #e8ff4d; --on-accent: #0a0a0a;
+    --green: #4ade80; --red: #f87171; --blue: #60a5fa; --yellow: #fbbf24; --orange: #fb923c;
+  }
+  :root[data-theme="light"] {
+    --bg: #ffffff; --surface: #f6f6f4; --surface2: #ececea; --border: #dcdcd8;
+    --text: #111111; --muted: #4a4a4a; --faint: #6b6b6b;
+    --green: #15803d; --red: #b91c1c; --blue: #1d4ed8; --yellow: #a16207; --orange: #c2410c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--text);
+    font: 14px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: -0.01em; }
+  .brand b { color: var(--accent); }
+  :root[data-theme="light"] .brand b { color: var(--text); background: var(--accent); padding: 0 4px; border-radius: 4px; }
+  .open { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 999px;
+          padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  .open:hover, .open:focus-visible { color: var(--text); border-color: var(--muted); outline: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .grid.series { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .frame { position: relative; aspect-ratio: 9 / 16; background: var(--surface2); display: block; width: 100%;
+           border: 0; padding: 0; cursor: default; color: var(--faint); }
+  button.frame { cursor: pointer; }
+  button.frame:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .frame img, .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .play { position: absolute; inset: 0; margin: auto; width: 44px; height: 44px; border-radius: 50%;
+          background: var(--accent); display: grid; place-items: center; box-shadow: 0 2px 12px #0006; }
+  .play::after { content: ""; margin-left: 4px; border-style: solid; border-width: 8px 0 8px 13px;
+                 border-color: transparent transparent transparent var(--on-accent); }
+  .placeholder { position: absolute; inset: 0; display: grid; place-items: center; font-size: 12px; padding: 12px; text-align: center; }
+  .chip { position: absolute; top: 8px; left: 8px; font-size: 11px; font-weight: 600; padding: 2px 8px;
+          border-radius: 999px; background: #000b; color: #fff; display: flex; align-items: center; gap: 5px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+  .bar { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: #0008; }
+  .bar span { display: block; height: 100%; background: var(--accent); }
+  .meta { padding: 8px 10px 10px; }
+  .title { font-weight: 600; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .sub { color: var(--faint); font-size: 12px; margin-top: 2px; }
+  .series .meta { padding: 12px; }
+  .row { display: flex; align-items: center; gap: 6px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .stat { font-size: 11px; color: var(--muted); background: var(--surface2); border-radius: 6px; padding: 2px 7px; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 12px; }
+  footer { color: var(--faint); font-size: 12px; margin-top: 10px; }
+  .s-green { color: var(--green); } .s-red { color: var(--red); } .s-blue { color: var(--blue); }
+  .s-yellow { color: var(--yellow); } .s-orange { color: var(--orange); } .s-muted { color: var(--faint); }
+  /* Chips sit on images over a fixed dark scrim, so their dots keep the dark-theme colours. */
+  .chip .dot.s-green { color: #4ade80; } .chip .dot.s-red { color: #f87171; } .chip .dot.s-blue { color: #60a5fa; }
+  .chip .dot.s-yellow { color: #fbbf24; } .chip .dot.s-orange { color: #fb923c; } .chip .dot.s-muted { color: #8a8a8a; }
+  @media (prefers-reduced-motion: no-preference) { .bar span { transition: width .4s ease; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0a0a0a"/><rect x="9.25" y="4" width="13.5" height="24" rx="2.5" fill="#e8ff4d"/><path fill="#0a0a0a" d="M12.7 11.9v8.2a.7.7 0 0 0 1.06.6l6.5-4.1a.7.7 0 0 0 0-1.2l-6.5-4.1a.7.7 0 0 0-1.06.6Z"/></svg>
+    <span>Faceless <b>Video Maker</b></span>
+  </div>
+  <button class="open" type="button" id="open">Open app ↗</button>
+</header>
+<main id="root"><div class="empty">Loading…</div></main>
+<footer id="foot" hidden></footer>
+<script>
+"use strict";
+const APP_URL = "https://facelessvideomaker.ai/dashboard";
+// Labels and colours match the web app (JobGrid.tsx, dashboard/workflows).
+const VIDEO_STATUS = {
+  pending: ["Pending", "s-muted"], processing: ["Generating", "s-blue"], paused: ["Paused", "s-orange"],
+  ready: ["Ready", "s-green"], complete: ["Complete", "s-green"], failed: ["Failed", "s-red"],
+  cancelled: ["Cancelled", "s-muted"], unknown: ["Unknown", "s-muted"],
+};
+const SERIES_STATUS = { active: ["Running", "s-green"], paused: ["Paused", "s-yellow"], stopped: ["Stopped", "s-muted"] };
+const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+// ---- Host bridge: MCP Apps JSON-RPC over postMessage ----
+let nextId = 1;
+const pending = new Map();
+function send(message) { window.parent.postMessage({ jsonrpc: "2.0", ...message }, "*"); }
+function request(method, params) {
+  const id = nextId++;
+  send({ id, method, params });
+  return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+}
+window.addEventListener("message", (event) => {
+  if (event.source !== window.parent) return;
+  const msg = event.data;
+  if (!msg || msg.jsonrpc !== "2.0") return;
+  if (msg.id != null && pending.has(msg.id)) {
+    const { resolve, reject } = pending.get(msg.id);
+    pending.delete(msg.id);
+    msg.error ? reject(msg.error) : resolve(msg.result);
+  } else if (msg.method === "ui/notifications/tool-result") {
+    render(msg.params && msg.params.structuredContent);
+  } else if (msg.method === "ui/notifications/host-context-changed") {
+    applyTheme(msg.params);
+  }
+});
+function applyTheme(context) {
+  if (context && context.theme) document.documentElement.dataset.theme = context.theme;
+}
+function openLink(url) {
+  request("ui/open-link", { url }).catch(() => window.open(url, "_blank", "noopener"));
+}
+document.getElementById("open").addEventListener("click", () => openLink(APP_URL));
+new ResizeObserver(() => {
+  const { scrollWidth: width, scrollHeight: height } = document.documentElement;
+  send({ method: "ui/notifications/size-changed", params: { width, height } });
+}).observe(document.documentElement);
+
+const appInfo = { name: "faceless-video-maker-gallery", version: "1.0.0" };
+request("ui/initialize", { protocolVersion: "2026-01-26", appInfo, clientInfo: appInfo, appCapabilities: {} })
+  .then((result) => {
+    applyTheme(result && result.hostContext);
+    send({ method: "ui/notifications/initialized", params: {} });
+  })
+  .catch(() => {});
+
+// ---- Rendering (DOM only, never innerHTML, since titles are user content) ----
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+function when(iso) {
+  const date = iso ? new Date(iso) : null;
+  if (!date || isNaN(date)) return "";
+  return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+function chip(label, tone) {
+  const node = el("span", "chip");
+  node.append(el("span", "dot " + tone), label);
+  return node;
+}
+function thumbnail(video) {
+  const thumbs = video.thumbnail_urls || {};
+  return thumbs.after || thumbs.mid || thumbs.before || null;
+}
+
+function videoCard(video) {
+  const [label, tone] = VIDEO_STATUS[video.status] || VIDEO_STATUS.unknown;
+  const name = video.title || video.niche || "Untitled video";
+  const card = el("article", "card");
+  const playable = Boolean(video.video_url);
+  const frame = el(playable ? "button" : "div", "frame");
+  if (playable) { frame.type = "button"; frame.setAttribute("aria-label", "Play " + name); }
+  const src = thumbnail(video);
+  if (src) {
+    const img = el("img");
+    img.alt = ""; img.loading = "lazy"; img.src = src;
+    img.onerror = () => img.remove();
+    frame.append(img);
+  } else {
+    frame.append(el("div", "placeholder", video.status === "processing" || video.status === "pending" ? (video.active_stage || "Being made…") : ""));
+  }
+  frame.append(chip(label, tone));
+  if (video.status === "processing" || video.status === "pending") {
+    const bar = el("div", "bar"), fill = el("span");
+    fill.style.width = Math.round(Math.max(0.03, Math.min(1, Number(video.progress) || 0)) * 100) + "%";
+    bar.append(fill); frame.append(bar);
+  }
+  if (playable) {
+    frame.append(el("span", "play"));
+    frame.addEventListener("click", () => {
+      const player = el("video");
+      player.src = video.video_url; player.controls = true; player.autoplay = true; player.playsInline = true;
+      const box = el("div", "frame");
+      box.append(player);
+      frame.replaceWith(box);
+    }, { once: true });
+  }
+  const meta = el("div", "meta");
+  meta.append(el("div", "title", name));
+  const sub = [video.format ? video.format.replace(/_/g, " ") : "", when(video.created_at)].filter(Boolean).join(" · ");
+  if (sub) meta.append(el("div", "sub", sub));
+  card.append(frame, meta);
+  return card;
+}
+
+function schedule(series) {
+  const days = (series.days_of_week || []).slice().sort();
+  let dayText = days.map((d) => DAYS[d]).join(", ");
+  if (days.length === 7) dayText = "Every day";
+  else if (days.join() === "0,1,2,3,4") dayText = "Weekdays";
+  else if (days.join() === "5,6") dayText = "Weekends";
+  const times = (series.times_of_day || []).join(", ");
+  return [dayText, times].filter(Boolean).join(" at ");
+}
+
+function seriesCard(series) {
+  const [label, tone] = SERIES_STATUS[series.status] || SERIES_STATUS.stopped;
+  const card = el("article", "card");
+  const meta = el("div", "meta");
+  const head = el("div", "row");
+  head.append(el("span", "dot " + tone), el("span", "sub " + tone, label));
+  meta.append(head, el("div", "title", series.name || series.theme || "Untitled series"));
+  const plan = schedule(series);
+  if (plan) meta.append(el("div", "sub", plan + (series.timezone ? " (" + series.timezone + ")" : "")));
+  if (series.status === "active" && series.next_slot_at) meta.append(el("div", "sub", "Next video " + when(series.next_slot_at)));
+  const counts = series.counts || {};
+  const stats = el("div", "stats");
+  [["promoted", "posted"], ["planned", "planned"], ["generating", "being made"], ["failed", "failed"], ["skipped", "skipped"]]
+    .forEach(([key, word]) => { if (counts[key]) stats.append(el("span", "stat", counts[key] + " " + word)); });
+  if (stats.childElementCount) meta.append(stats);
+  card.append(meta);
+  return card;
+}
+
+function render(data) {
+  const root = document.getElementById("root");
+  const foot = document.getElementById("foot");
+  root.replaceChildren();
+  foot.hidden = true;
+  if (!data) { root.append(el("div", "empty", "Nothing to show.")); return; }
+
+  if (Array.isArray(data.series)) {
+    const grid = el("div", "grid series");
+    data.series.forEach((s) => grid.append(seriesCard(s)));
+    root.append(data.series.length ? grid : el("div", "empty", "No Autopilot series yet. Ask me to start one."));
+    if (data.stopped_count) { foot.textContent = data.stopped_count + " stopped series not shown."; foot.hidden = false; }
+    return;
+  }
+
+  const videos = Array.isArray(data.videos) ? data.videos : data.id ? [data] : [];
+  const grid = el("div", "grid");
+  videos.forEach((v) => grid.append(videoCard(v)));
+  root.append(videos.length ? grid : el("div", "empty", "No videos here yet. Ask me to make one."));
+  const hidden = Object.entries(data.hidden || {}).filter(([, n]) => n).map(([status, n]) => n + " " + status);
+  const notes = [];
+  if (hidden.length) notes.push(hidden.join(", ") + " hidden");
+  if (data.next_offset != null) notes.push("more available");
+  if (notes.length) { foot.textContent = notes.join(" · "); foot.hidden = false; }
+}
+</script>
+</body>
+</html>

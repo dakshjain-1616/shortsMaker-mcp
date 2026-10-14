@@ -83,7 +83,9 @@ async def create_job(request: Request, user: str, body: dict):
     job_id = str(uuid.uuid4())
     job = {
         "id": job_id,
-        "status": "queued",
+        # The real API reports queued jobs as "pending"; a "failed-" niche stands in for a failure.
+        "status": "failed" if niche.startswith("failed-") else "pending",
+        "created_at": f"2026-10-01T00:00:{len(JOBS):02d}+00:00",
         "niche": niche,
         "format": body.get("format"),
         "credits_cost": JOB_COST,

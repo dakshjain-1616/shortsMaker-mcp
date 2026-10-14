@@ -1,4 +1,4 @@
-"""ASGI entrypoint for the standalone ShortsMaker MCP service."""
+"""ASGI entrypoint for the standalone Faceless Video Maker MCP service."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import Icon
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route, Router
@@ -19,26 +20,64 @@ from .oauth_auth import BearerValidationMiddleware, TokenValidator
 from .rate_limit import RequestRateLimiter
 from .tool_auth import ToolAuthMiddleware
 from .tools import register_tools
+from .tools.gallery import gallery_extension
+
+_STATIC = Path(__file__).with_name("static")
+_DASHBOARD_PATH = _STATIC / "dashboard.html"
+# Some clients cap or truncate instructions (ChatGPT weighs the first ~512 characters), so the
+# product summary and the two presentation rules come first.
+INSTRUCTIONS = """\
+Faceless Video Maker makes short AI videos for YouTube Shorts, TikTok and Instagram Reels, and \
+Autopilot series that make and post a new video on a schedule.
+- Ask one short question at a time. If you have an interactive question or multiple-choice \
+tool, use it: 2-4 options, each with a short description, one marked recommended. Never paste \
+raw option lists or JSON.
+- Results with shown_as_gallery=true are already on screen as a visual gallery: reply in one \
+or two sentences instead of listing them again. Otherwise show one line per item: title or \
+topic, status, and the link when ready.
+- New video: topic, then format (the 3-4 that fit the topic, plus Auto), length, sound and \
+voice, style (Auto by default), then get_video_price, a summary with the credits, and approval.
+- New series: theme, format, days (Every day / Weekdays / Weekends), times and timezone, \
+accounts from list_connections (connect_account if there are none), YouTube visibility, end \
+date (Never / 7 days / 15 days / 1 month), price per video, a summary, and approval.
+- Before any write, show the exact action, cost and destination and get explicit approval, then \
+call it with confirm=true.
+- Making a video takes a few minutes and posts are queued. Never say a video is ready or posted \
+until a read tool shows it, and do not poll in a loop: check when the user asks.
+- Lists hide failed and cancelled videos and stopped series; mention the hidden counts in a few \
+words and show them only if asked.
+- Social accounts connect through the browser link from connect_account; never ask for \
+passwords or tokens. You can read credits and plans but cannot buy credits or change billing: \
+send the user to https://facelessvideomaker.ai."""
+
+
+def _icons(settings: Settings) -> list[Icon]:
+    """Brand icons served by this service; absolute URLs need the public origin, so none locally."""
+    if not settings.resource_url:
+        return []
+    public = urlparse(settings.resource_url)
+    origin = f"{public.scheme}://{public.netloc}"
+    return [
+        Icon(src=f"{origin}/icon.svg", mime_type="image/svg+xml", sizes=["any"]),
+        Icon(src=f"{origin}/icon.png", mime_type="image/png", sizes=["180x180"]),
+    ]
+
 
 settings = load_settings()
 backend = BackendClient(settings)
 token_validator = TokenValidator(settings)
 server = MCPServer(
-    "ShortsMaker",
-    description="User-scoped video generation and publishing tools for ShortsMaker.",
-    instructions=(
-        "Use read-only tools to inspect options, price, credits, jobs, connections, and posts. "
-        "Before any write, explain the exact action, cost, destination, and asynchronous outcome "
-        "to the user and obtain explicit approval. Never claim a job or post is complete merely "
-        "because the API accepted it. Provider credentials must be handled through browser OAuth, "
-        "not pasted into chat. You can read credits, subscription, and plans, but you cannot buy "
-        "credits or change billing: direct the user to the ShortsMaker website for that."
-    ),
-    version="0.2.0",
+    "faceless-video-maker",
+    title="Faceless Video Maker",
+    description="Make faceless short videos and Autopilot series, and post them to YouTube, TikTok and Instagram.",
+    instructions=INSTRUCTIONS,
+    website_url="https://facelessvideomaker.ai",
+    icons=_icons(settings),
+    version="0.3.0",
+    extensions=[gallery_extension(list(settings.media_origins))],
 )
 register_tools(server, backend)
 server.middleware.append(ToolAuthMiddleware(settings.resource_url, server.list_tools))
-_DASHBOARD_PATH = Path(__file__).with_name("static") / "dashboard.html"
 
 
 def _transport_security(settings: Settings) -> TransportSecuritySettings:
@@ -55,6 +94,13 @@ def _transport_security(settings: Settings) -> TransportSecuritySettings:
 
 def _dashboard(request):
     return FileResponse(_DASHBOARD_PATH, media_type="text/html")
+
+
+def _static(name: str, media_type: str):
+    def endpoint(request):
+        return FileResponse(_STATIC / name, media_type=media_type, headers={"Cache-Control": "public, max-age=604800"})
+
+    return endpoint
 
 
 def _health_live(request):
@@ -118,6 +164,9 @@ def create_app() -> ASGIApp:
     )
     routes = [
         Route("/health/live", _health_live, methods=["GET"]),
+        Route("/icon.svg", _static("icon.svg", "image/svg+xml"), methods=["GET"]),
+        Route("/icon.png", _static("icon.png", "image/png"), methods=["GET"]),
+        Route("/favicon.ico", _static("favicon.ico", "image/x-icon"), methods=["GET"]),
         Route(
             "/.well-known/oauth-protected-resource", _protected_resource_metadata, methods=["GET"]
         ),

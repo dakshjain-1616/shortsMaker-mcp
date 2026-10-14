@@ -27,6 +27,18 @@ has been tested. SSE-only, stdio-only, or confidential-client-only configuration
 appropriate client adapter or a separately scoped integration; changing security checks to
 accept arbitrary callbacks is not a compatibility solution.
 
+## Gallery, icons and guided questions
+
+| Client | Gallery (MCP App) | Server icon | Asks with options |
+|---|---|---|---|
+| Claude.ai, Claude Desktop | Rendered | Favicon of the MCP host's domain | Its own question UI, driven by the server instructions |
+| ChatGPT | Rendered | Set in the app's developer settings | Driven by the server instructions |
+| Claude Code | Not rendered; uses the text result | Not verified | Its own question tool |
+| Cursor, VS Code | Rendered (VS Code: verify the installed version) | Not verified | Driven by the server instructions |
+
+Every gallery tool returns the same structured data with or without the gallery, so no client
+depends on it. Verify each row in the real client before claiming it to users.
+
 ## Browser and backend flow
 
 1. MCP returns a bearer challenge naming protected-resource metadata. That document names the

@@ -27,15 +27,15 @@ Niche = Annotated[
     ),
 ]
 
-JobId = Annotated[UUID, Field(description="The ShortsMaker video job UUID.")]
+JobId = Annotated[UUID, Field(description="A video id, from list_videos or create_video.")]
 
-PostId = Annotated[UUID, Field(description="The ShortsMaker scheduled-post UUID.")]
+PostId = Annotated[UUID, Field(description="A post id, from list_posts or publish_video.")]
 
-ConnectionId = Annotated[UUID, Field(description="A connected social-account UUID.")]
+ConnectionId = Annotated[UUID, Field(description="A connected social account id, from list_connections.")]
 
-WorkflowId = Annotated[UUID, Field(description="A ShortsMaker recurring-workflow UUID.")]
+WorkflowId = Annotated[UUID, Field(description="An Autopilot series id, from list_series.")]
 
-WorkflowSlotId = Annotated[UUID, Field(description="A scheduled workflow-slot UUID.")]
+WorkflowSlotId = Annotated[UUID, Field(description="A scheduled series slot id, from list_series_slots.")]
 
 Confirm = Annotated[
     bool,
@@ -56,11 +56,12 @@ IdempotencyKey = Annotated[
     ),
 ]
 
+# Reads only touch the signed-in user's own workspace, so they are not open-world.
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
-    openWorldHint=True,
+    openWorldHint=False,
 )
 
 WRITE = ToolAnnotations(
@@ -144,21 +145,27 @@ def _dict_result(result: Any) -> dict[str, Any]:
 
 def _backend_error(exc: Exception) -> ToolError:
     if isinstance(exc, BackendUnavailable):
-        return ToolError("ShortsMaker API is unavailable. Try again shortly.")
+        return ToolError("Faceless Video Maker is temporarily unavailable. Tell the user and try again in a minute.")
     if isinstance(exc, BackendAPIError):
         # Upstream diagnostics can contain private URLs or credentials, even on a 4xx.
         messages = {
-            401: "ShortsMaker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
-            402: "Insufficient credits. Check your balance and the quoted cost before retrying.",
+            401: "Faceless Video Maker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
+            402: (
+                "Not enough credits. Show the user the price and their balance (get_credits). "
+                "They can top up at https://facelessvideomaker.ai; you cannot buy credits."
+            ),
             403: "Your connected account does not have permission for this action.",
-            404: "The requested item was not found.",
-            409: "This action conflicts with the item's current state.",
-            429: "ShortsMaker rate limit reached. Try again shortly.",
+            404: "Not found. Call list_videos, list_series or list_posts to find a valid id.",
+            409: (
+                "Not allowed in the item's current state (for example it is already running, "
+                "finished or cancelled). Read it with get_video or get_series, then explain the state to the user."
+            ),
+            429: "Too many requests. Wait a minute before trying again; do not retry in a loop.",
         }
         if exc.status_code >= 500:
-            return ToolError("ShortsMaker could not complete that request. Try again shortly.")
-        return ToolError(messages.get(exc.status_code, "ShortsMaker rejected this request. Check the options and try again."))
-    return ToolError("ShortsMaker could not complete that request.")
+            return ToolError("Faceless Video Maker could not complete that request. Try again shortly.")
+        return ToolError(messages.get(exc.status_code, "Faceless Video Maker rejected this request. Check the values against get_video_options and try again."))
+    return ToolError("Faceless Video Maker could not complete that request.")
 
 def _require_confirmation(confirm: bool, action: str) -> None:
     if not confirm:
@@ -174,7 +181,7 @@ def _public_result(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: (
-                "This operation failed. Check its status in ShortsMaker."
+                "This operation failed. The user can see details at https://facelessvideomaker.ai."
                 if key in {"error", "last_error"} and item
                 else _public_result(item)
             )

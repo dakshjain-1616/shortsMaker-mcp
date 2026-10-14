@@ -9,7 +9,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from shortsmaker_mcp import tools
 from shortsmaker_mcp.oauth_auth import Principal, _principal
-from shortsmaker_mcp.tools import _common, video
+from shortsmaker_mcp.tools import _common, video, workflows
 
 TEST_PRINCIPAL = Principal("user-1", frozenset({"mcp:read", "mcp:write"}), "client-1")
 
@@ -101,8 +101,8 @@ def _registered_tools():
 def test_registered_tools_expose_risk_annotations_and_structured_schemas():
     server, _ = _registered_tools()
 
-    read_tool = server._tool_manager._tools["shortsmaker_get_credit_status"]
-    write_tool = server._tool_manager._tools["shortsmaker_create_video"]
+    read_tool = server._tool_manager._tools["get_credits"]
+    write_tool = server._tool_manager._tools["create_video"]
 
     assert read_tool.annotations.read_only_hint is True
     assert read_tool.annotations.destructive_hint is False
@@ -116,7 +116,7 @@ def test_registered_tools_expose_risk_annotations_and_structured_schemas():
 
 def test_create_video_requires_confirmation_without_calling_backend():
     server, backend = _registered_tools()
-    tool = server._tool_manager._tools["shortsmaker_create_video"]
+    tool = server._tool_manager._tools["create_video"]
 
     with pytest.raises(ToolError, match="explicit approval"):
         asyncio.run(
@@ -138,7 +138,7 @@ def test_create_video_forwards_confirmed_idempotent_request():
         "status": "queued",
         "credits_cost": 4,
     }
-    tool = server._tool_manager._tools["shortsmaker_create_video"]
+    tool = server._tool_manager._tools["create_video"]
     context = _principal.set(TEST_PRINCIPAL)
     try:
         result = asyncio.run(
@@ -161,7 +161,7 @@ def test_create_video_forwards_confirmed_idempotent_request():
         body={
             "niche": "deep sea animals",
             "total_length": 15,
-            "format": "transformation",
+            "format": "auto",
             "mode": "lite",
             "resolution": "720p",
             "idempotency_key": "request-123",
@@ -176,9 +176,9 @@ def test_workflow_reader_serializes_filters_and_slot_time_bounds():
     when = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
     context = _principal.set(TEST_PRINCIPAL)
     try:
-        asyncio.run(server._tool_manager._tools["shortsmaker_list_workflows"].fn("paused"))
+        asyncio.run(server._tool_manager._tools["list_series"].fn("paused"))
         asyncio.run(
-            server._tool_manager._tools["shortsmaker_list_workflow_slots"].fn(
+            server._tool_manager._tools["list_series_slots"].fn(
                 workflow_id, "planned", when, when
             )
         )
@@ -188,7 +188,8 @@ def test_workflow_reader_serializes_filters_and_slot_time_bounds():
     assert backend.request.await_args_list[0].args == (
         "GET", "/api/workflows", "bridge-token"
     )
-    assert backend.request.await_args_list[0].kwargs["params"] == {"status": "paused"}
+    # The status filter is applied after the lifecycle rule, so the backend gets no filter.
+    assert backend.request.await_args_list[0].kwargs["params"] is None
     assert backend.request.await_args_list[1].kwargs["params"] == {
         "status": "planned",
         "from": when.isoformat(),
@@ -199,7 +200,7 @@ def test_workflow_reader_serializes_filters_and_slot_time_bounds():
 def test_create_workflow_validates_and_forwards_confirmed_schedule():
     server, backend = _registered_tools()
     backend.request.return_value = {"id": "workflow-1", "status": "active"}
-    tool = server._tool_manager._tools["shortsmaker_create_workflow"]
+    tool = server._tool_manager._tools["create_series"]
     context = _principal.set(TEST_PRINCIPAL)
     try:
         result = asyncio.run(
@@ -239,9 +240,9 @@ def test_create_workflow_validates_and_forwards_confirmed_schedule():
 
 def test_workflow_update_requires_at_least_one_field():
     server, backend = _registered_tools()
-    tool = server._tool_manager._tools["shortsmaker_update_workflow"]
+    tool = server._tool_manager._tools["update_series"]
 
-    with pytest.raises(ToolError, match="at least one workflow field"):
+    with pytest.raises(ToolError, match="at least one series field"):
         asyncio.run(tool.fn(UUID(int=1), confirm=True))
 
     backend.request.assert_not_awaited()
@@ -249,11 +250,13 @@ def test_workflow_update_requires_at_least_one_field():
 
 def test_workflow_prompts_require_preview_and_confirmation():
     server, _ = _registered_tools()
-    create_prompt = server._prompt_manager._prompts["shortsmaker_create_video_workflow"]
-    publish_prompt = server._prompt_manager._prompts["shortsmaker_publish_video_workflow"]
-    workflow_prompt = server._prompt_manager._prompts["shortsmaker_workflow_management"]
+    create_prompt = server._prompt_manager._prompts["new_video"]
+    publish_prompt = server._prompt_manager._prompts["share_video"]
+    workflow_prompt = server._prompt_manager._prompts["review_series"]
 
-    create_text = create_prompt.fn("deep sea animals", 15)[0]["content"]["text"]
+    create_text = create_prompt.fn("deep sea animals")[0]["content"]["text"]
+    series_prompt = server._prompt_manager._prompts["new_series"]
+    series_text = series_prompt.fn()[0]["content"]["text"]
     publish_text = publish_prompt.fn(UUID(int=0))[0]["content"]["text"]
 
     assert "resolve the estimated price" in create_text
@@ -261,22 +264,26 @@ def test_workflow_prompts_require_preview_and_confirmation():
     assert "never request provider tokens" in publish_text
     assert "queued, not that it has already been uploaded" in publish_text
     assert "planned work" in workflow_prompt.fn(UUID(int=0))[0]["content"]["text"]
+    # Without arguments the guided prompts start by asking, one question at a time.
+    assert "ask me what it should be about" in create_prompt.fn()[0]["content"]["text"]
+    assert "one short question at a time" in series_text
+    assert "list_connections" in series_text and "confirm=true" in series_text
 
 
-def test_video_options_passes_mode_and_resolution_to_lengths():
+def test_video_options_passes_format_mode_and_resolution_to_lengths():
     server, backend = _registered_tools()
     backend.request.side_effect = lambda method, path, token, **kw: {"path": path, **kw}
     context = _principal.set(TEST_PRINCIPAL)
     try:
         result = asyncio.run(
-            server._tool_manager._tools["shortsmaker_get_video_options"].fn(
-                mode="pro", resolution="1080p"
+            server._tool_manager._tools["get_video_options"].fn(
+                format="pov", mode="pro", resolution="1080p"
             )
         )
     finally:
         _principal.reset(context)
 
-    assert result["lengths"]["params"] == {"mode": "pro", "resolution": "1080p"}
+    assert result["lengths"]["params"] == {"format": "pov", "mode": "pro", "resolution": "1080p"}
     assert result["config"]["path"] == "/api/config"
 
 
@@ -310,3 +317,40 @@ def test_backend_error_diagnostics_cannot_disclose_internal_requests(status):
     diagnostic = 'HTTP error https://10.0.0.5/engine/resolve?access_token=SECRET'
     message = str(_common._backend_error(BackendAPIError(status, diagnostic)))
     assert 'SECRET' not in message and '10.0.0.5' not in message and '/engine/' not in message
+
+
+def test_videos_list_in_progress_first_and_hide_failures_by_default():
+    def job(id, status, minute):
+        return {"id": id, "status": status, "created_at": f"2026-10-01T10:{minute:02d}:00+00:00"}
+
+    jobs = [
+        job("failed-new", "failed", 50), job("ready-new", "ready", 40), job("cancelled", "cancelled", 30),
+        job("making", "processing", 5), job("ready-old", "complete", 1), job("queued", "pending", 20),
+        job("future-status", "rendering", 45),
+    ]
+
+    shown, hidden = video._working_first(jobs, "default")
+    assert [j["id"] for j in shown] == ["making", "queued", "ready-new", "ready-old", "future-status"]
+    assert hidden == {"failed": 1, "cancelled": 1}
+
+    assert [j["id"] for j in video._working_first(jobs, "failed")[0]] == ["failed-new"]
+    assert [j["id"] for j in video._working_first(jobs, "in_progress")[0]] == ["making", "queued"]
+    assert len(video._working_first(jobs, "all")[0]) == len(jobs)
+
+
+def test_series_list_running_first_and_ended_series_count_as_stopped():
+    series = [
+        {"id": "paused-new", "status": "paused", "created_at": "2026-10-05"},
+        {"id": "stopped", "status": "stopped", "created_at": "2026-10-04"},
+        {"id": "active-old", "status": "active", "created_at": "2026-09-01"},
+        {"id": "ended", "status": "active", "created_at": "2026-10-03", "ends_at": "2026-10-01T00:00:00Z"},
+        {"id": "active-new", "status": "active", "created_at": "2026-10-02", "ends_at": "2099-01-01T00:00:00Z"},
+    ]
+
+    listed = workflows._running_first([dict(s) for s in series], None)
+    assert [s["id"] for s in listed["series"]] == ["active-new", "active-old", "paused-new"]
+    assert listed["stopped_count"] == 2
+
+    stopped = workflows._running_first([dict(s) for s in series], "stopped")
+    assert [s["id"] for s in stopped["series"]] == ["stopped", "ended"]  # newest first
+    assert all(s["status"] == "stopped" for s in stopped["series"])

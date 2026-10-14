@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ShortsMaker MCP Tester</title>
+    <title>Faceless Video Maker MCP Tester</title>
     <style>
       :root {
         color-scheme: light;
@@ -44,12 +44,12 @@
   <body>
     <main>
       <section class="card">
-        <h1>ShortsMaker MCP tester</h1>
+        <h1>Faceless Video Maker MCP tester</h1>
         <p>Use this local dashboard to test the real MCP endpoint against the staging backend.</p>
         <p class="endpoint">MCP endpoint: <code id="endpoint"></code></p>
         <div class="warning">The access token is stored in this browser's local storage. Use this only on your private local machine.</div>
 
-        <label for="token">ShortsMaker staging access token</label>
+        <label for="token">Staging access token</label>
         <input id="token" type="password" autocomplete="off" placeholder="Paste access_token from Swagger sign-in" />
         <div class="row" style="margin-top: 12px">
           <button class="secondary" id="save">Save token locally</button>
@@ -109,7 +109,7 @@
           <button class="secondary" id="workflow-slots">List slots</button>
         </div>
         <p id="status" class="status" aria-live="polite"></p>
-        <pre id="output">Click “Get credits” to call shortsmaker_get_credit_status.</pre>
+        <pre id="output">Click “Get credits” to call get_credits.</pre>
       </section>
 
       <section class="card danger-zone">
@@ -347,51 +347,51 @@
           const optional = inputValue(id);
           if (optional) argumentsValue[key] = optional;
         }
-        return callTool("shortsmaker_resolve_video_price", argumentsValue, "Video price loaded through MCP.");
+        return callTool("get_video_price", argumentsValue, "Video price loaded through MCP.");
       });
       document.getElementById("credits").onclick = () => runAction(
-        () => callTool("shortsmaker_get_credit_status", {}, "Credit status loaded through MCP.")
+        () => callTool("get_credits", {}, "Credit status loaded through MCP.")
       );
       document.getElementById("subscription").onclick = () => runAction(
-        () => callTool("shortsmaker_get_subscription", {}, "Subscription status loaded through MCP.")
+        () => callTool("get_subscription", {}, "Subscription status loaded through MCP.")
       );
       document.getElementById("plans").onclick = () => runAction(
-        () => callTool("shortsmaker_list_subscription_plans", {}, "Subscription plans loaded through MCP.")
+        () => callTool("list_plans", {}, "Subscription plans loaded through MCP.")
       );
       document.getElementById("features").onclick = () => runAction(
-        () => callTool("shortsmaker_get_account_features", {}, "Account features loaded through MCP.")
+        () => callTool("get_account_features", {}, "Account features loaded through MCP.")
       );
       document.getElementById("options").onclick = () => runAction(
-        () => callTool("shortsmaker_get_video_options", {}, "Video options loaded through MCP.")
+        () => callTool("get_video_options", {}, "Video options loaded through MCP.")
       );
       document.getElementById("videos").onclick = () => runAction(
-        () => callTool("shortsmaker_list_videos", {}, "Videos loaded through MCP.")
+        () => callTool("list_videos", {}, "Videos loaded through MCP.")
       );
       document.getElementById("connections").onclick = () => runAction(
-        () => callTool("shortsmaker_list_connections", {}, "Connected accounts loaded through MCP.")
+        () => callTool("list_connections", {}, "Connected accounts loaded through MCP.")
       );
       document.getElementById("posts").onclick = () => runAction(
-        () => callTool("shortsmaker_list_posts", {}, "Posts loaded through MCP.")
+        () => callTool("list_posts", {}, "Posts loaded through MCP.")
       );
       document.getElementById("health").onclick = () => runAction(
-        () => callTool("shortsmaker_publishing_health", {}, "Publishing health loaded through MCP.")
+        () => callTool("check_publishing_health", {}, "Publishing health loaded through MCP.")
       );
       document.getElementById("video").onclick = () => runAction(() => {
         const jobId = document.getElementById("job-id").value.trim();
         if (!jobId) throw new Error("Enter a job UUID first.");
-        return callTool("shortsmaker_get_video", { job_id: jobId }, "Video status loaded through MCP.");
+        return callTool("get_video", { job_id: jobId }, "Video status loaded through MCP.");
       });
       document.getElementById("workflows").onclick = () => runAction(
-        () => callTool("shortsmaker_list_workflows", {}, "Workflows loaded through MCP.")
+        () => callTool("list_series", {}, "Workflows loaded through MCP.")
       );
       document.getElementById("workflow").onclick = () => runAction(() => {
-        return callTool("shortsmaker_get_workflow", {
-          workflow_id: requiredValue("workflow-id", "Workflow UUID"),
+        return callTool("get_series", {
+          series_id: requiredValue("workflow-id", "Workflow UUID"),
         }, "Workflow loaded through MCP.");
       });
       document.getElementById("workflow-slots").onclick = () => runAction(() => {
-        return callTool("shortsmaker_list_workflow_slots", {
-          workflow_id: requiredValue("workflow-id", "Workflow UUID"),
+        return callTool("list_series_slots", {
+          series_id: requiredValue("workflow-id", "Workflow UUID"),
         }, "Workflow slots loaded through MCP.");
       });
 
@@ -407,13 +407,13 @@
           idempotency_key: requiredValue("create-idempotency", "Idempotency key"),
           confirm: true,
         };
-        return callTool("shortsmaker_create_video", argumentsValue, "Video job submitted to staging.")
+        return callTool("create_video", argumentsValue, "Video job submitted to staging.")
           .then(() => { document.getElementById("create-idempotency").value = newIdempotencyKey(); });
       });
 
       document.getElementById("control-video").onclick = () => runAction(() => {
         if (!checked("control-confirm")) throw new Error("Check the video-action confirmation first.");
-        return callTool("shortsmaker_control_video", {
+        return callTool("control_video", {
           job_id: requiredValue("control-job-id", "Job UUID"),
           action: document.getElementById("control-action").value,
           confirm: true,
@@ -432,12 +432,12 @@
         const visibility = document.getElementById("metadata-visibility").value;
         if (visibility) argumentsValue.visibility = visibility;
         if (Object.keys(argumentsValue).length === 2) throw new Error("Provide at least one metadata field.");
-        return callTool("shortsmaker_update_video_metadata", argumentsValue, "Video metadata updated through MCP.");
+        return callTool("update_video_details", argumentsValue, "Video metadata updated through MCP.");
       });
 
       document.getElementById("start-connection").onclick = () => runAction(() => {
         if (!checked("connection-confirm")) throw new Error("Check the connection confirmation first.");
-        return callTool("shortsmaker_start_connection", {
+        return callTool("connect_account", {
           platform: document.getElementById("connection-platform").value,
           confirm: true,
         }, "Authorization URL created. Open it from the output to continue.");
@@ -445,7 +445,7 @@
 
       document.getElementById("disconnect").onclick = () => runAction(() => {
         if (!checked("disconnect-confirm")) throw new Error("Check the disconnect confirmation first.");
-        return callTool("shortsmaker_disconnect", {
+        return callTool("disconnect_account", {
           connection_id: requiredValue("disconnect-id", "Connection UUID"),
           confirm: true,
         }, "Social account disconnect submitted to staging.");
@@ -469,12 +469,12 @@
         }
         const tags = csvValues("publish-tags");
         if (tags.length) argumentsValue.tags = tags;
-        return callTool("shortsmaker_publish_video", argumentsValue, "Post queued through MCP; check post status for completion.");
+        return callTool("publish_video", argumentsValue, "Post queued through MCP; check post status for completion.");
       });
 
       document.getElementById("control-post").onclick = () => runAction(() => {
         if (!checked("post-confirm")) throw new Error("Check the post-action confirmation first.");
-        return callTool("shortsmaker_control_post", {
+        return callTool("control_post", {
           post_id: requiredValue("post-id", "Post UUID"),
           action: document.getElementById("post-action").value,
           confirm: true,

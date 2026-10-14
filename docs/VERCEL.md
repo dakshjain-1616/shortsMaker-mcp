@@ -1,7 +1,7 @@
 # Vercel testing deployment
 
 The MCP runs as a Python ASGI function. OAuth and Platform API operations run on the separate
-ShortsMaker backend; Postgres is accessed only by that backend. For this test deployment, ngrok
+Faceless Video Maker backend; Postgres is accessed only by that backend. For this test deployment, ngrok
 exposes the local backend while its database remains a disposable local Postgres database.
 
 ```text
@@ -115,3 +115,10 @@ sign-in, including a confirmed local metadata write, refresh, revocation, and re
 References: [Vercel Python runtime](https://vercel.com/docs/functions/runtimes/python),
 [Vercel function limits](https://vercel.com/docs/functions/limitations),
 [ngrok free-plan behavior](https://ngrok.com/docs/pricing-limits/free-plan-limits).
+
+## Production domain and icon
+
+Serve the production MCP from the brand domain, for example `mcp.facelessvideomaker.ai`. Claude.ai
+shows a connector icon taken from the favicon of the MCP host's domain rather than the server's
+advertised `icons`, so a `*.vercel.app` host shows Vercel's logo. Make sure the apex domain serves
+the brand favicon. Other clients use the `icons` in `serverInfo`, which this service serves itself.

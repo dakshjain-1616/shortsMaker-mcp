@@ -25,20 +25,20 @@ def test_dashboard_exposes_read_only_controls():
         assert f'id="{element_id}"' in html
 
     for tool_name in (
-        "shortsmaker_get_credit_status",
-        "shortsmaker_get_subscription",
-        "shortsmaker_list_subscription_plans",
-        "shortsmaker_get_account_features",
-        "shortsmaker_resolve_video_price",
-        "shortsmaker_get_video_options",
-        "shortsmaker_list_videos",
-        "shortsmaker_get_video",
-        "shortsmaker_list_connections",
-        "shortsmaker_list_posts",
-        "shortsmaker_publishing_health",
-        "shortsmaker_list_workflows",
-        "shortsmaker_get_workflow",
-        "shortsmaker_list_workflow_slots",
+        "get_credits",
+        "get_subscription",
+        "list_plans",
+        "get_account_features",
+        "get_video_price",
+        "get_video_options",
+        "list_videos",
+        "get_video",
+        "list_connections",
+        "list_posts",
+        "check_publishing_health",
+        "list_series",
+        "get_series",
+        "list_series_slots",
     ):
         assert tool_name in html
 
@@ -70,13 +70,13 @@ def test_dashboard_exposes_explicitly_gated_write_controls():
         assert f'id="{element_id}"' in html
 
     for tool_name in (
-        "shortsmaker_create_video",
-        "shortsmaker_control_video",
-        "shortsmaker_update_video_metadata",
-        "shortsmaker_start_connection",
-        "shortsmaker_disconnect",
-        "shortsmaker_publish_video",
-        "shortsmaker_control_post",
+        "create_video",
+        "control_video",
+        "update_video_details",
+        "connect_account",
+        "disconnect_account",
+        "publish_video",
+        "control_post",
     ):
         assert tool_name in html
 

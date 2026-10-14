@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
@@ -26,6 +27,7 @@ from ._common import (
     _optional_params,
     _require_confirmation,
 )
+from .gallery import GALLERY_META, shown_as_gallery
 
 
 def _resolve_params(
@@ -98,21 +100,52 @@ def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
     return {key: job.get(key) for key in keys if key in job}
 
 
+# The web app's dashboard order (app/lib/settled.ts): videos still being made first.
+_STATUS_ORDER = {"processing": 0, "pending": 1, "paused": 2, "ready": 3, "complete": 4, "failed": 5, "cancelled": 6}
+_HIDDEN_BY_DEFAULT = {"failed", "cancelled"}
+_SHOW = {
+    "in_progress": {"processing", "pending", "paused"},
+    "ready": {"ready", "complete"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+}
+
+
+def _working_first(jobs: list[dict[str, Any]], show: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Filter to ``show`` and sort in-progress first, newest first; count what default hides."""
+    jobs = sorted(jobs, key=lambda job: job.get("created_at") or "", reverse=True)
+    jobs.sort(key=lambda job: _STATUS_ORDER.get(job.get("status"), 7))
+    if show == "all":
+        return jobs, {}
+    if show != "default":
+        return [job for job in jobs if job.get("status") in _SHOW[show]], {}
+    # Exclude rather than include, so a status the backend adds later still shows up.
+    shown = [job for job in jobs if job.get("status") not in _HIDDEN_BY_DEFAULT]
+    hidden: dict[str, int] = {}
+    for job in jobs:
+        if job.get("status") in _HIDDEN_BY_DEFAULT:
+            hidden[job["status"]] = hidden.get(job["status"], 0) + 1
+    return shown, hidden
+
+
 def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
-        title="Get video generation options",
+        title="Get video options",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_get_video_options(
+    async def get_video_options(
+        format: Annotated[str, Field(max_length=64, description="Format to list valid lengths for.")] = "auto",
         mode: Annotated[str, Field(max_length=32, description="Mode to list valid lengths for.")] = "lite",
         resolution: Annotated[str, Field(max_length=32, description="Resolution to list valid lengths for.")] = "720p",
     ) -> dict[str, Any]:
-        """Read current video formats, modes, resolutions, and valid length options.
+        """Read the choices for a new video: formats, styles per format, voices, languages,
+        music tracks, modes, resolutions, and the valid lengths for one format.
 
-        Valid lengths depend on mode and resolution, so pass the combination the user is
-        considering. Use this before asking the user to choose generation settings. This tool is
-        read-only; it does not create a job or spend credits.
+        Call this before asking the user anything about settings, then ask one choice at a time
+        with 2-4 options (label plus a short description) and a recommended default; never paste
+        the whole catalogue. Valid lengths depend on format, mode and resolution, so call again
+        after the user picks a format. Read-only; spends nothing.
         """
         config, lengths = await asyncio.gather(
             _api(backend, "GET", "/api/config"),
@@ -121,6 +154,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "GET",
                 "/api/lengths",
                 params={
+                    "format": _bounded_text(format, "format", 64, required=True),
                     "mode": _bounded_text(mode, "mode", 32, required=True),
                     "resolution": _bounded_text(resolution, "resolution", 32, required=True),
                 },
@@ -133,16 +167,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_resolve_video_price(
+    async def get_video_price(
         total_length: Annotated[int, Field(ge=1, le=3600, description="Requested duration in seconds.")],
         mode: Annotated[str, Field(max_length=32, description="Generation mode, usually lite.")] = "lite",
-        format: Annotated[str, Field(max_length=64, description="Generation format.")] = "transformation",
+        format: Annotated[str, Field(max_length=64, description="Format id from get_video_options; auto picks one.")] = "auto",
         resolution: Annotated[str, Field(max_length=32, description="Output resolution.")] = "720p",
-        audio_mode: Annotated[str | None, Field(max_length=32, description="Optional audio mode.")] = None,
+        audio_mode: Annotated[str | None, Field(max_length=32, description="Optional sound choice, such as narration.")] = None,
         workflow: Annotated[str | None, Field(max_length=64, description="Optional workflow name.")] = None,
-        niche: Annotated[str | None, Field(max_length=10_000, description="Optional topic used by auto resolution.")] = None,
+        niche: Annotated[str | None, Field(max_length=10_000, description="The topic; lets auto pick the real format.")] = None,
     ) -> dict[str, Any]:
-        """Preview the backend-resolved settings and price without creating a job.
+        """Quote a video's price and final settings without creating it.
 
         Always use this before create_video. Show the user ``estimated_credits``, the number of
         credits the job will cost. Provider cost is kept internal. The ``credits_cost`` that
@@ -161,21 +195,31 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return {key: value for key, value in quote.items() if key != "estimated_cost"}
 
     @server.tool(
-        title="List video jobs",
+        title="List my videos",
         annotations=READ_ONLY,
+        meta=GALLERY_META,
         structured_output=True,
     )
-    async def shortsmaker_list_videos(
-        limit: Annotated[int, Field(ge=1, le=50, description="Jobs to return per page, newest first.")] = 5,
-        offset: Annotated[int, Field(ge=0, description="Jobs to skip; pass next_offset from the previous page.")] = 0,
-        updated_since: Annotated[datetime | None, Field(description="Only jobs updated after this timezone-aware timestamp.")] = None,
+    async def list_videos(
+        show: Annotated[
+            Literal["default", "in_progress", "ready", "failed", "cancelled", "all"],
+            Field(description=(
+                "Which videos: default is everything except failed and cancelled. Use failed or "
+                "cancelled only when the user asks about those."
+            )),
+        ] = "default",
+        limit: Annotated[int, Field(ge=1, le=50, description="Videos per page.")] = 6,
+        offset: Annotated[int, Field(ge=0, description="Videos to skip; pass next_offset from the previous page.")] = 0,
+        updated_since: Annotated[datetime | None, Field(description="Only videos updated after this timezone-aware timestamp.")] = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List one page of the signed-in user's video jobs, newest first.
+        """List the user's videos: ones still being made first, then the newest finished ones.
 
-        Returns at most ``limit`` jobs (default 5) to keep responses small. When ``next_offset``
-        is not null, more jobs exist: call again with ``offset=next_offset`` only if the user
-        wants them. The backend exposes its 200 most recent jobs. With ``updated_since`` the
-        order is oldest change first, so advance by the last job's ``updated_at``.
+        Failed and cancelled videos are hidden by default and only counted in ``hidden``;
+        mention that count in one short line, and list them only if the user asks. When
+        ``next_offset`` is not null, more videos exist: fetch them only if the user wants more.
+        Covers the 200 most recent videos. With ``updated_since`` the list is a change feed in
+        oldest-change-first order; advance by the last video's ``updated_at``.
         """
         result = await _api(
             backend,
@@ -183,50 +227,63 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             "/api/jobs",
             params=_optional_params(updated_since=updated_since),
         )
+        jobs = result if isinstance(result, list) else []
+        hidden: dict[str, int] = {}
+        if updated_since is None:
+            jobs, hidden = _working_first(jobs, show)
+        elif show == "default":
+            jobs = [job for job in jobs if job.get("status") not in _HIDDEN_BY_DEFAULT]
+        elif show != "all":
+            jobs = [job for job in jobs if job.get("status") in _SHOW[show]]
         end = offset + limit
         return {
-            "videos": [_job_summary(job) for job in result[offset:end]],
-            "total": len(result),
+            "videos": [_job_summary(job) for job in jobs[offset:end]],
+            "total": len(jobs),
+            "hidden": hidden,
             "offset": offset,
-            "next_offset": end if end < len(result) else None,
+            "next_offset": end if end < len(jobs) else None,
+            "shown_as_gallery": shown_as_gallery(ctx),
         }
 
     @server.tool(
-        title="Get video job",
+        title="Get a video",
         annotations=READ_ONLY,
+        meta=GALLERY_META,
         structured_output=True,
     )
-    async def shortsmaker_get_video(job_id: JobId) -> dict[str, Any]:
-        """Read one owned video job, including status, progress, and temporary media links."""
+    async def get_video(job_id: JobId, ctx: Context | None = None) -> dict[str, Any]:
+        """Read one video: status, progress while it is being made, and its video and thumbnail
+        links once ready. Links are temporary; read the video again rather than reusing old ones."""
         result = await _api(backend, "GET", f"/api/jobs/{job_id}")
-        return _job_summary(result)
+        return {**_job_summary(result), "shown_as_gallery": shown_as_gallery(ctx)}
 
     @server.tool(
-        title="Create and queue a video",
+        title="Make a video",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_create_video(
+    async def create_video(
         niche: Niche,
         total_length: Annotated[int, Field(ge=1, le=3600, description="Requested duration in seconds.")],
         idempotency_key: IdempotencyKey,
-        format: Annotated[str, Field(max_length=64, description="Generation format.")] = "transformation",
-        mode: Annotated[str, Field(max_length=32, description="Generation mode.")] = "lite",
+        format: Annotated[str, Field(max_length=64, description="Format id from get_video_options; auto picks one.")] = "auto",
+        mode: Annotated[str, Field(max_length=32, description="Quality mode from get_video_options.")] = "lite",
         resolution: Annotated[str, Field(max_length=32, description="Output resolution.")] = "720p",
-        style: Annotated[str | None, Field(max_length=200, description="Optional visual style.")] = None,
-        audio_mode: Annotated[str | None, Field(max_length=32, description="Optional audio mode.")] = None,
+        style: Annotated[str | None, Field(max_length=200, description="Optional visual style for this format; omit for auto.")] = None,
+        audio_mode: Annotated[str | None, Field(max_length=32, description="Optional sound choice, such as narration.")] = None,
         narrator_voice: Annotated[str | None, Field(max_length=64, description="Optional narrator voice.")] = None,
         narration_language: Annotated[str | None, Field(max_length=64, description="Optional narration language.")] = None,
         music_track: Annotated[str | None, Field(max_length=128, description="Optional music track identifier.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Create a generation job and hold credits; this is a staging write operation.
+        """Start making a video. This holds credits.
 
-        Before calling, resolve the price and show the user ``estimated_credits``, summarize the
-        settings, and obtain explicit user approval. The exact charge comes back as
-        ``credits_cost``. Set confirm=true only after approval. A unique idempotency_key is
-        required so a network retry cannot create a duplicate job. The result means queued or
-        accepted, not that video generation has finished.
+        Before calling: gather the choices one at a time (topic, format, length, sound and
+        voice, style), quote it with get_video_price, show the summary with
+        ``estimated_credits`` and get explicit approval. The exact charge comes back as
+        ``credits_cost``. Use a fresh idempotency_key so a retry cannot make a duplicate.
+        The result means queued, not finished: making a video takes a few minutes. Tell the
+        user, and check with get_video when they ask; do not poll in a loop.
         """
         _require_confirmation(confirm, "Video creation")
         body = _create_params(
@@ -246,11 +303,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return _job_summary(result) if isinstance(result, dict) else {"result": result}
 
     @server.tool(
-        title="Control a video job",
+        title="Cancel, pause or retry a video",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_control_video(
+    async def control_video(
         job_id: JobId,
         action: Annotated[Literal["cancel", "pause", "retry"], Field(description="Job action to perform.")],
         confirm: Confirm = False,
@@ -264,11 +321,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return _dict_result(await _api(backend, "POST", f"/api/jobs/{job_id}/{action}"))
 
     @server.tool(
-        title="Update video metadata",
+        title="Edit video title and details",
         annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def shortsmaker_update_video_metadata(
+    async def update_video_details(
         job_id: JobId,
         title: Annotated[str | None, Field(max_length=500, description="New title.")] = None,
         description: Annotated[str | None, Field(max_length=10_000, description="New description.")] = None,

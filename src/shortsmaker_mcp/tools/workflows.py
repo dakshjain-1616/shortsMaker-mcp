@@ -1,16 +1,22 @@
-"""Recurring generation-and-publishing workflow tools."""
+"""Autopilot series tools: recurring video generation and publishing.
+
+The backend and its API call these "workflows"; the product and these tools call them series.
+"""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import AwareDatetime, Field
 
 from ..backend_client import BackendClient
 from ._common import (
+    IDEMPOTENT_WRITE,
     READ_ONLY,
     WRITE,
     Confirm,
@@ -24,6 +30,7 @@ from ._common import (
     _optional_params,
     _require_confirmation,
 )
+from .gallery import GALLERY_META, shown_as_gallery
 
 
 def _workflow_days(days: list[int]) -> list[int]:
@@ -82,38 +89,76 @@ def _workflow_create_body(
     )
 
 
+_LIFECYCLE_ORDER = {"active": 0, "paused": 1, "stopped": 2}
+
+
+def _lifecycle(series: dict[str, Any], now: datetime) -> str:
+    """Same rule as the web app's lifecycleOf: an active series past its end date has stopped."""
+    ends_at = series.get("ends_at")
+    if series.get("status") == "active" and ends_at:
+        try:
+            if datetime.fromisoformat(ends_at) <= now:
+                return "stopped"
+        except (TypeError, ValueError):
+            pass
+    return series.get("status") or "stopped"
+
+
+def _running_first(series: list[dict[str, Any]], status: str | None) -> dict[str, Any]:
+    """Running series first, then paused; stopped ones only when asked for, as a count otherwise."""
+    now = datetime.now(UTC)
+    for item in series:
+        item["status"] = _lifecycle(item, now)
+    # Two stable sorts: newest first, then by lifecycle, so each group stays newest first.
+    series = sorted(series, key=lambda item: item.get("created_at") or "", reverse=True)
+    series.sort(key=lambda item: _LIFECYCLE_ORDER.get(item["status"], 3))
+    if status:
+        return {"series": [item for item in series if item["status"] == status]}
+    shown = [item for item in series if item["status"] != "stopped"]
+    return {"series": shown, "stopped_count": len(series) - len(shown)}
+
+
 def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
-        title="List recurring workflows",
+        title="List Autopilot series",
         annotations=READ_ONLY,
+        meta=GALLERY_META,
         structured_output=True,
     )
-    async def shortsmaker_list_workflows(
+    async def list_series(
         status: Annotated[
             Literal["active", "paused", "stopped"] | None,
-            Field(description="Optional workflow status filter."),
+            Field(description="Only series in this state. Omit to get running and paused series."),
         ] = None,
-    ) -> list[dict[str, Any]]:
-        """List the user's recurring generation-and-publishing workflows and slot counts."""
-        result = await _api(backend, "GET", "/api/workflows", params=_optional_params(status=status))
-        return result if isinstance(result, list) else []
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """List the user's Autopilot series: recurring schedules that make and post videos.
+
+        Running (active) series come first, then paused ones. Stopped or ended series are left
+        out and counted in ``stopped_count``; pass status="stopped" only if the user asks for them.
+        Each series includes its schedule, ``next_slot_at`` and slot counts by status.
+        """
+        # Filter here, not in the backend: an "active" series past its end date counts as stopped.
+        result = await _api(backend, "GET", "/api/workflows")
+        listed = _running_first(result if isinstance(result, list) else [], status)
+        return {**listed, "shown_as_gallery": shown_as_gallery(ctx)}
 
     @server.tool(
-        title="Get recurring workflow",
+        title="Get Autopilot series",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_get_workflow(workflow_id: WorkflowId) -> dict[str, Any]:
-        """Read one owned recurring workflow, including cadence, status, and slot counts."""
-        return _dict_result(await _api(backend, "GET", f"/api/workflows/{workflow_id}"))
+    async def get_series(series_id: WorkflowId) -> dict[str, Any]:
+        """Read one Autopilot series, including its schedule, status, next video time and slot counts."""
+        return _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
 
     @server.tool(
-        title="List workflow slots",
+        title="List series slots",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def shortsmaker_list_workflow_slots(
-        workflow_id: WorkflowId,
+    async def list_series_slots(
+        series_id: WorkflowId,
         status: Annotated[
             Literal["planned", "generating", "promoted", "failed", "skipped"] | None,
             Field(description="Optional slot status filter."),
@@ -127,7 +172,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             Field(description="Optional inclusive upper bound; must include a timezone."),
         ] = None,
     ) -> list[dict[str, Any]]:
-        """Read up to the backend's recent 200 scheduled slots for one owned workflow."""
+        """List the scheduled slots of one series: each slot is one planned, generating or posted video.
+
+        Returns up to the 200 most recent slots. Use it to show what is coming up next or why a
+        video was skipped or failed.
+        """
         params = _optional_params(
             status=status,
             **{
@@ -135,17 +184,17 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "to": to_time,
             },
         )
-        result = await _api(backend, "GET", f"/api/workflows/{workflow_id}/slots", params=params)
+        result = await _api(backend, "GET", f"/api/workflows/{series_id}/slots", params=params)
         return result if isinstance(result, list) else []
 
     @server.tool(
-        title="Create recurring workflow",
+        title="Create Autopilot series",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_create_workflow(
-        name: Annotated[str, Field(min_length=1, max_length=120, description="Workflow display name.")],
-        theme: Annotated[str, Field(min_length=3, max_length=2000, description="Brief for recurring videos.")],
+    async def create_series(
+        name: Annotated[str, Field(min_length=1, max_length=120, description="Series display name.")],
+        theme: Annotated[str, Field(min_length=3, max_length=2000, description="What the series is about: the brief every video is generated from.")],
         connection_ids: Annotated[
             list[UUID],
             Field(min_length=1, max_length=20, description="Owned connected accounts to publish to."),
@@ -161,26 +210,30 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         ],
         guidance: Annotated[str | None, Field(max_length=2000, description="Optional generation guidance.")] = None,
         avoid: Annotated[str | None, Field(max_length=2000, description="Optional generation exclusions.")] = None,
-        variation: Annotated[bool, Field(description="Use variants of one theme instead of fresh ideas.")] = False,
+        variation: Annotated[bool, Field(description="Make variations of one video instead of a fresh idea each time.")] = False,
         visibility: Annotated[
             Literal["public", "unlisted", "private"],
             Field(description="Default YouTube visibility."),
         ] = "public",
-        lead_minutes: Annotated[int, Field(ge=30, le=1440, description="Minutes before posting to start generation.")] = 360,
-        grace_minutes: Annotated[int, Field(ge=0, le=10080, description="How late a slot may be handled.")] = 360,
-        ends_at: Annotated[AwareDatetime | None, Field(description="Optional timezone-aware final posting date.")] = None,
+        lead_minutes: Annotated[int, Field(ge=30, le=1440, description="Head start: minutes before each post time to start making the video.")] = 360,
+        grace_minutes: Annotated[int, Field(ge=0, le=10080, description="Late-post window: how many minutes late a video may still be posted.")] = 360,
+        ends_at: Annotated[AwareDatetime | None, Field(description="When the series ends; omit to run until stopped.")] = None,
         post_description: Annotated[str | None, Field(max_length=10_000, description="Optional shared post description.")] = None,
         post_tags: Annotated[list[str] | None, Field(max_length=100, description="Optional shared post tags.")] = None,
-        job_defaults: Annotated[dict[str, Any] | None, Field(description="Optional backend generation defaults.")] = None,
+        job_defaults: Annotated[dict[str, Any] | None, Field(description=(
+                "Video settings for every video, using create_video's keys: format, style, "
+                "total_length, audio_mode, mode, resolution, narrator_voice, narration_language, music_track."
+            ))] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Create an active recurring generation-and-publishing workflow.
+        """Start an Autopilot series that makes and posts a new video on a schedule.
 
-        This creates a schedule that can generate videos and publish them to the selected
-        accounts over time. Before calling, show the cadence, theme, destination accounts,
-        visibility, and likely credit usage; call only after explicit approval.
+        Before calling, gather the choices step by step (theme, format, days, times and
+        timezone, accounts from list_connections, visibility, end date), quote the price per
+        video with get_video_price, show the summary and get explicit approval. Each video
+        spends credits when it is made.
         """
-        _require_confirmation(confirm, "Creating a recurring workflow")
+        _require_confirmation(confirm, "Creating an Autopilot series")
         body = _workflow_create_body(
             name=name,
             theme=theme,
@@ -202,12 +255,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return _dict_result(await _api(backend, "POST", "/api/workflows", body=body))
 
     @server.tool(
-        title="Update recurring workflow",
-        annotations=WRITE,
+        title="Update Autopilot series",
+        annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def shortsmaker_update_workflow(
-        workflow_id: WorkflowId,
+    async def update_series(
+        series_id: WorkflowId,
         name: Annotated[str | None, Field(max_length=120, description="Replacement display name.")] = None,
         theme: Annotated[str | None, Field(max_length=2000, description="Replacement generation brief.")] = None,
         guidance: Annotated[str | None, Field(max_length=2000, description="Replacement guidance.")] = None,
@@ -226,15 +279,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         ends_at: Annotated[AwareDatetime | None, Field(description="Replacement timezone-aware end date.")] = None,
         post_description: Annotated[str | None, Field(max_length=10_000, description="Replacement shared description.")] = None,
         post_tags: Annotated[list[str] | None, Field(max_length=100, description="Replacement shared tags.")] = None,
-        job_defaults: Annotated[dict[str, Any] | None, Field(description="Replacement generation defaults.")] = None,
+        job_defaults: Annotated[dict[str, Any] | None, Field(description="Replacement video settings, same keys as create_series.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Update an existing recurring workflow after explicit review.
+        """Change an Autopilot series after the user reviews the change.
 
         Changing the cadence or generation brief causes the backend to drop planned slots and
         re-plan them. Show that consequence before calling. Omitted fields stay unchanged.
         """
-        _require_confirmation(confirm, "Updating a recurring workflow")
+        _require_confirmation(confirm, "Updating an Autopilot series")
         body = _optional_params(
             name=_bounded_text(name, "name", 120),
             theme=_bounded_text(theme, "theme", 2000),
@@ -254,60 +307,60 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             job_defaults=job_defaults,
         )
         if not body:
-            raise ToolError("Provide at least one workflow field to update.")
-        return _dict_result(await _api(backend, "PATCH", f"/api/workflows/{workflow_id}", body=body))
+            raise ToolError("Provide at least one series field to update.")
+        return _dict_result(await _api(backend, "PATCH", f"/api/workflows/{series_id}", body=body))
 
     @server.tool(
-        title="Pause recurring workflow",
-        annotations=WRITE,
+        title="Pause Autopilot series",
+        annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def shortsmaker_pause_workflow(workflow_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Pause a recurring workflow so new videos and queued posts are held."""
-        _require_confirmation(confirm, "Pausing a recurring workflow")
-        return _dict_result(await _api(backend, "POST", f"/api/workflows/{workflow_id}/pause"))
+    async def pause_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
+        """Pause a series: no new videos are made and queued posts are held until resumed."""
+        _require_confirmation(confirm, "Pausing an Autopilot series")
+        return _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/pause"))
 
     @server.tool(
-        title="Resume recurring workflow",
-        annotations=WRITE,
+        title="Resume Autopilot series",
+        annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def shortsmaker_resume_workflow(
-        workflow_id: WorkflowId,
+    async def resume_series(
+        series_id: WorkflowId,
         ends_at: Annotated[AwareDatetime | None, Field(description="Optional new timezone-aware end date.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Resume a paused or stopped workflow and continue planning from the current time."""
-        _require_confirmation(confirm, "Resuming a recurring workflow")
+        """Resume a paused or stopped series; it plans new videos from now on."""
+        _require_confirmation(confirm, "Resuming an Autopilot series")
         body = _optional_params(ends_at=ends_at)
-        return _dict_result(await _api(backend, "POST", f"/api/workflows/{workflow_id}/resume", body=body or None))
+        return _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/resume", body=body or None))
 
     @server.tool(
-        title="Stop recurring workflow",
+        title="Stop Autopilot series",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_stop_workflow(workflow_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Stop a workflow, canceling queued posts while retaining generated video history."""
-        _require_confirmation(confirm, "Stopping a recurring workflow")
-        return _dict_result(await _api(backend, "POST", f"/api/workflows/{workflow_id}/stop"))
+    async def stop_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
+        """Stop a series and cancel its queued posts. Videos already made are kept."""
+        _require_confirmation(confirm, "Stopping an Autopilot series")
+        return _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/stop"))
 
     @server.tool(
-        title="Delete recurring workflow",
+        title="Delete Autopilot series",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_delete_workflow(workflow_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Delete a workflow and its calendar; published history remains in the posts list."""
-        _require_confirmation(confirm, "Deleting a recurring workflow")
-        return _dict_result(await _api(backend, "DELETE", f"/api/workflows/{workflow_id}"))
+    async def delete_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
+        """Delete a series and its schedule. Published posts stay in list_posts."""
+        _require_confirmation(confirm, "Deleting an Autopilot series")
+        return _dict_result(await _api(backend, "DELETE", f"/api/workflows/{series_id}"))
 
     @server.tool(
-        title="Update workflow slot",
-        annotations=WRITE,
+        title="Update series slot",
+        annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def shortsmaker_update_workflow_slot(
+    async def update_series_slot(
         slot_id: WorkflowSlotId,
         title: Annotated[str | None, Field(max_length=500, description="Replacement slot title.")] = None,
         prompt: Annotated[str | None, Field(min_length=3, max_length=10_000, description="Replacement video prompt.")] = None,
@@ -315,8 +368,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         slot_at: Annotated[AwareDatetime | None, Field(description="Replacement timezone-aware posting time.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Edit one planned workflow slot before generation has started."""
-        _require_confirmation(confirm, "Updating a workflow slot")
+        """Edit one planned slot of a series (its idea, prompt, settings or time) before it is made."""
+        _require_confirmation(confirm, "Updating a series slot")
         body = _optional_params(
             title=_bounded_text(title, "title", 500),
             prompt=_bounded_text(prompt, "prompt", 10_000),
@@ -324,26 +377,26 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             slot_at=slot_at,
         )
         if not body:
-            raise ToolError("Provide at least one workflow-slot field to update.")
+            raise ToolError("Provide at least one slot field to update.")
         return _dict_result(await _api(backend, "PATCH", f"/api/workflow-slots/{slot_id}", body=body))
 
     @server.tool(
-        title="Control workflow slot",
+        title="Skip, retry or re-idea a series slot",
         annotations=WRITE,
         structured_output=True,
     )
-    async def shortsmaker_control_workflow_slot(
+    async def control_series_slot(
         slot_id: WorkflowSlotId,
         action: Annotated[Literal["skip", "retry", "regenerate_idea"], Field(description="Slot action to perform.")],
         suggested_changes: Annotated[str | None, Field(max_length=1000, description="Optional guidance for a regenerated idea.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Skip, retry, or regenerate one workflow slot after explicit approval.
+        """Skip, retry, or regenerate the idea of one series slot after explicit approval.
 
         Retry can cause a new generation attempt and regenerate_idea calls the backend idea
         engine. A slot must still be eligible for the selected operation.
         """
-        _require_confirmation(confirm, f"Workflow slot {action}")
+        _require_confirmation(confirm, f"Series slot {action}")
         if action == "regenerate_idea":
             body = _optional_params(suggested_changes=_bounded_text(suggested_changes, "suggested_changes", 1000))
             return _dict_result(await _api(

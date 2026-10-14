@@ -1,4 +1,4 @@
-"""Connect to the local ShortsMaker MCP over Streamable HTTP and run safe read calls.
+"""Connect to the local Faceless Video Maker MCP over Streamable HTTP and run safe read calls.
 
 Usage:
     SHORTSMAKER_ACCESS_TOKEN='...' python scripts/mcp_smoke_client.py
@@ -22,7 +22,7 @@ from mcp.types import Implementation
 async def main() -> None:
     token = os.environ.get("SHORTSMAKER_ACCESS_TOKEN", "").strip()
     if not token:
-        raise SystemExit("Set SHORTSMAKER_ACCESS_TOKEN to a ShortsMaker access token first.")
+        raise SystemExit("Set SHORTSMAKER_ACCESS_TOKEN to a Faceless Video Maker access token first.")
 
     endpoint = os.environ.get("MCP_ENDPOINT", "http://127.0.0.1:8002/mcp/")
     headers = {"Authorization": f"Bearer {token}"}
@@ -37,12 +37,12 @@ async def main() -> None:
             for tool in tools.tools:
                 print(f"- {tool.name}")
 
-            credits = await client.call_tool("shortsmaker_get_credit_status", {})
+            credits = await client.call_tool("get_credits", {})
             print("\nCredit-status result:")
             print(json.dumps(credits.model_dump(mode="json"), indent=2, default=str))
 
             price = await client.call_tool(
-                "shortsmaker_resolve_video_price",
+                "get_video_price",
                 {
                     "total_length": 15,
                     "mode": "lite",
