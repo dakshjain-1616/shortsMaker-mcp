@@ -70,6 +70,7 @@ The price tool estimates credits; video creation reports the exact charged amoun
 | Variable | Purpose |
 |---|---|
 | `MCP_BACKEND_API_URL` | Platform API base URL. |
+| `MCP_APP_URL` | The web app the gallery's "Open app", series cards and top-up links point to. Defaults to `https://stage.facelessvideomaker.ai`; set it to production at launch. |
 | `MCP_MEDIA_ORIGINS` | Comma-separated https origins the gallery may load thumbnails and videos from. Defaults to `https://*.amazonaws.com`. |
 | `MCP_OAUTH_ISSUER` | Optional backend OAuth issuer override; defaults to `MCP_BACKEND_API_URL`. |
 | `MCP_RESOURCE_URL` | Exact public `/mcp/` URL, including trailing slash. |

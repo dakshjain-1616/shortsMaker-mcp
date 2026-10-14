@@ -17,7 +17,7 @@ GALLERY_META = {"ui": {"resourceUri": GALLERY_URI}}
 _GALLERY_HTML = Path(__file__).parent.parent / "static" / "gallery.html"
 
 
-def gallery_extension(media_origins: list[str]) -> Apps:
+def gallery_extension(media_origins: list[str], app_url: str) -> Apps:
     """The Apps extension: advertises UI support and serves the gallery page.
 
     Thumbnails and videos are presigned storage URLs, so the page may only load media from
@@ -26,7 +26,7 @@ def gallery_extension(media_origins: list[str]) -> Apps:
     apps = Apps()
     apps.add_html_resource(
         GALLERY_URI,
-        _GALLERY_HTML.read_text(encoding="utf-8"),
+        _GALLERY_HTML.read_text(encoding="utf-8").replace("__APP_URL__", app_url),
         title="Faceless Video Maker gallery",
         description="Your videos and Autopilot series, with thumbnails and players.",
         csp=ResourceCsp(resource_domains=media_origins),

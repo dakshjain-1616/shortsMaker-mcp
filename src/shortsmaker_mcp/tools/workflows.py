@@ -178,7 +178,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         ] = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """List the user's Autopilot series: recurring schedules that make and post videos.
+        """Use when the user asks about their series, Autopilot or workflows (all the same
+        thing): recurring schedules that make and post videos.
 
         Running (active) series come first, then paused ones. Stopped or ended series are left
         out and counted in ``stopped_count``; pass status="stopped" only if the user asks for them.

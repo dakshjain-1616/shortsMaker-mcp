@@ -39,6 +39,11 @@ def _boolean(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be true or false")
 
 
+# The web app users are sent to (Open app, top-ups, details). Stage until production launches.
+APP_URL = os.getenv("MCP_APP_URL", "https://stage.facelessvideomaker.ai").strip().rstrip("/")
+BILLING_URL = f"{APP_URL}/dashboard/billing"
+
+
 def _backend_url() -> str:
     value = os.getenv("MCP_BACKEND_API_URL", "").strip().rstrip("/")
     try:

@@ -20,7 +20,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Read the signed-in user's current credit balance and recent credit status.
 
         This MCP cannot buy credits or change billing. If the balance is too low, tell the user to
-        top up on the Faceless Video Maker website (https://facelessvideomaker.ai).
+        add credits on the website (the billing link is in the server instructions).
         """
         return _dict_result(await _api(backend, "GET", "/api/payments/credit-status"))
 
@@ -40,7 +40,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     )
     async def list_plans() -> dict[str, Any]:
         """List active subscription plans and prices. Read-only: plan changes and payments are done by
-        the user on the Faceless Video Maker website (https://facelessvideomaker.ai), not through this MCP."""
+        the user on the website (the billing link is in the server instructions), not through this MCP."""
         return _dict_result(await _api(backend, "GET", "/api/payments/plans"))
 
     @server.tool(

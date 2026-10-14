@@ -54,6 +54,10 @@
   .row { display: flex; align-items: center; gap: 6px; }
   .stats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   .stat { font-size: 11px; color: var(--muted); background: var(--surface2); border-radius: 6px; padding: 2px 7px; }
+  .stat.bad { color: var(--red); }
+  button.card.link { display: flex; flex-direction: column; justify-content: flex-start; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; padding: 0; }
+  button.card.link:hover, button.card.link:focus-visible { border-color: var(--muted); outline: none; }
+  .reason { margin-top: 4px; }
   .empty { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 12px; }
   footer { color: var(--faint); font-size: 12px; margin-top: 10px; }
   .s-green { color: var(--green); } .s-red { color: var(--red); } .s-blue { color: var(--blue); }
@@ -76,7 +80,8 @@
 <footer id="foot" hidden></footer>
 <script>
 "use strict";
-const APP_URL = "https://facelessvideomaker.ai/dashboard";
+const APP_URL = "__APP_URL__";  // filled in by the server (MCP_APP_URL)
+let openTarget = APP_URL + "/dashboard";
 // Labels and colours match the web app (JobGrid.tsx, dashboard/workflows).
 const VIDEO_STATUS = {
   pending: ["Pending", "s-muted"], processing: ["Generating", "s-blue"], paused: ["Paused", "s-orange"],
@@ -115,7 +120,7 @@ function applyTheme(context) {
 function openLink(url) {
   request("ui/open-link", { url }).catch(() => window.open(url, "_blank", "noopener"));
 }
-document.getElementById("open").addEventListener("click", () => openLink(APP_URL));
+document.getElementById("open").addEventListener("click", () => openLink(openTarget));
 new ResizeObserver(() => {
   const { scrollWidth: width, scrollHeight: height } = document.documentElement;
   send({ method: "ui/notifications/size-changed", params: { width, height } });
@@ -203,7 +208,10 @@ function schedule(series) {
 
 function seriesCard(series) {
   const [label, tone] = SERIES_STATUS[series.status] || SERIES_STATUS.stopped;
-  const card = el("article", "card");
+  const card = el("button", "card link");
+  card.type = "button";
+  card.setAttribute("aria-label", "Open " + (series.name || "series") + " in Faceless Video Maker");
+  card.addEventListener("click", () => openLink(APP_URL + "/dashboard/workflows/" + encodeURIComponent(series.id)));
   const meta = el("div", "meta");
   const head = el("div", "row");
   head.append(el("span", "dot " + tone), el("span", "sub " + tone, label));
@@ -211,10 +219,11 @@ function seriesCard(series) {
   const plan = schedule(series);
   if (plan) meta.append(el("div", "sub", plan + (series.timezone ? " (" + series.timezone + ")" : "")));
   if (series.status === "active" && series.next_slot_at) meta.append(el("div", "sub", "Next video " + when(series.next_slot_at)));
+  if (series.last_error) meta.append(el("div", "sub reason " + tone, series.last_error));
   const counts = series.counts || {};
   const stats = el("div", "stats");
   [["promoted", "posted"], ["planned", "planned"], ["generating", "being made"], ["failed", "failed"], ["skipped", "skipped"]]
-    .forEach(([key, word]) => { if (counts[key]) stats.append(el("span", "stat", counts[key] + " " + word)); });
+    .forEach(([key, word]) => { if (counts[key]) stats.append(el("span", key === "failed" ? "stat bad" : "stat", counts[key] + " " + word)); });
   if (stats.childElementCount) meta.append(stats);
   card.append(meta);
   return card;
@@ -228,6 +237,7 @@ function render(data) {
   if (!data) { root.append(el("div", "empty", "Nothing to show.")); return; }
 
   if (Array.isArray(data.series)) {
+    openTarget = APP_URL + "/dashboard/workflows";
     const grid = el("div", "grid series");
     data.series.forEach((s) => grid.append(seriesCard(s)));
     root.append(data.series.length ? grid : el("div", "empty", "No Autopilot series yet. Ask me to start one."));
@@ -235,6 +245,7 @@ function render(data) {
     return;
   }
 
+  openTarget = APP_URL + "/dashboard";
   const videos = Array.isArray(data.videos) ? data.videos : data.id ? [data] : [];
   const grid = el("div", "grid");
   videos.forEach((v) => grid.append(videoCard(v)));

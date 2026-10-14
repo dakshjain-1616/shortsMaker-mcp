@@ -17,6 +17,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ..backend_client import BackendAPIError, BackendClient, BackendUnavailable
+from ..config import APP_URL, BILLING_URL
 from ..oauth_auth import current_principal
 
 Niche = Annotated[
@@ -159,14 +160,14 @@ _URL = re.compile(r"https?://\S+")
 _FALLBACK = {
     401: "Faceless Video Maker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
     402: "Not enough credits for this.",
-    403: "This action isn't available through the connector yet. The user can do it on the website (https://facelessvideomaker.ai).",
+    403: f"This action isn't available through the connector yet. The user can do it on the website ({APP_URL}).",
     404: "Not found.",
     409: "Not allowed in the item's current state.",
     429: "Too many requests. Wait a minute before trying again; do not retry in a loop.",
 }
 # A next step for the model, added after the backend's own sentence.
 _NEXT_STEP = {
-    402: " Show the user the price and their balance (get_credits). They can top up at https://facelessvideomaker.ai; you cannot buy credits.",
+    402: f" Show the user the price and their balance (get_credits). They can add credits at {BILLING_URL}; you cannot buy credits.",
     404: " Use the matching list tool (list_videos, list_series, list_posts, list_connections) to find a valid id.",
 }
 
@@ -218,7 +219,7 @@ def _public_result(value: Any) -> Any:
         cleaned = {}
         for key, item in value.items():
             if key == "error" and item:
-                cleaned[key] = "This video failed. The user can see details at https://facelessvideomaker.ai."
+                cleaned[key] = f"This video failed. The user can see details at {APP_URL}/dashboard."
             elif key == "last_error" and isinstance(item, str):
                 cleaned[key] = _public_text(item)
             else:
