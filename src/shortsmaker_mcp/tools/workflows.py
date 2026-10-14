@@ -29,8 +29,10 @@ from ._common import (
     _clean_tags,
     _dedupe_ids,
     _dict_result,
+    _items,
     _optional_params,
     _require_confirmation,
+    _with_next,
 )
 from .gallery import GALLERY_META, shown_as_gallery
 
@@ -181,9 +183,10 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Use when the user asks about their series, Autopilot or workflows (all the same
         thing): recurring schedules that make and post videos.
 
-        Running (active) series come first, then paused ones. Stopped or ended series are left
-        out and counted in ``stopped_count``; pass status="stopped" only if the user asks for them.
-        Each series includes its schedule, ``next_slot_at`` and slot counts by status.
+        Do: mention ``stopped_count`` in a few words; for a paused series, quote its last_error.
+        Don't: list stopped series unless asked (pass status="stopped" then).
+        Returns: ``series`` (running first, then paused) with schedule, ``next_slot_at`` and
+        slot counts by status, plus ``stopped_count``.
         """
         # Filter here, not in the backend: an "active" series past its end date counts as stopped.
         result = await _api(backend, "GET", "/api/workflows")
@@ -196,7 +199,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def get_series(series_id: WorkflowId) -> dict[str, Any]:
-        """Read one Autopilot series, including its schedule, status, next video time and slot counts."""
+        """Use when the user asks about one series: when the next video is, why it paused, or its settings.
+
+        Do: quote ``last_error`` when it is paused; read its slots with list_series_slots for detail.
+        Don't: guess why it paused from the status alone.
+        Returns: schedule, status, timezone, ``next_slot_at``, job_defaults, slot counts, last_error.
+        """
         return _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
 
     @server.tool(
@@ -218,11 +226,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             AwareDatetime | None,
             Field(description="Optional inclusive upper bound; must include a timezone."),
         ] = None,
-    ) -> list[dict[str, Any]]:
-        """List the scheduled slots of one series: each slot is one planned, generating or posted video.
+    ) -> dict[str, Any]:
+        """Use when the user asks what a series will post next, or why one of its videos was
+        skipped or failed. Each slot is one planned, generating or posted video.
 
-        Returns up to the 200 most recent slots. Use it to show what is coming up next or why a
-        video was skipped or failed.
+        Do: show times in the series timezone; quote a failed or skipped slot's last_error.
+        Don't: retry or skip slots from here; that is control_series_slot, after approval.
+        Returns: ``items`` (id, slot_at, status, title, last_error; up to the 200 most recent)
+        and ``count``.
         """
         params = _optional_params(
             status=status,
@@ -231,8 +242,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "to": to_time,
             },
         )
-        result = await _api(backend, "GET", f"/api/workflows/{series_id}/slots", params=params)
-        return result if isinstance(result, list) else []
+        return _items(await _api(backend, "GET", f"/api/workflows/{series_id}/slots", params=params))
 
     @server.tool(
         title="Create Autopilot series",
@@ -277,11 +287,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Use when the user has approved starting an Autopilot series that makes and posts a
         new video on a schedule. Each video spends credits when it is made.
 
-        Before calling, gather the choices one at a time (theme, format, video length, days,
-        times and timezone, accounts from list_connections, visibility, end date), quote one
-        video with get_video_price, and show a summary with videos per week and credits per
-        week. job_defaults must include total_length; mode, format and resolution default to
-        lite, auto and 720p. Never assume a timezone: ask.
+        Do: gather the choices one at a time (theme, format, video length, days, times and
+        timezone, accounts from list_connections, visibility, end date), quote one video with
+        get_video_price, and show a summary with videos per week and credits per week.
+        job_defaults must include total_length; mode, format and resolution default to lite,
+        auto and 720p.
+        Don't: assume a timezone (ask), use accounts whose status is not active, or create it
+        when list_connections is empty (offer connect_account first).
+        Returns: the series (id, status, next_slot_at) and ``next_step``.
         Example: "post a space fact every weekday at 9am and 6pm on my channel" ->
         days_of_week=[0,1,2,3,4], times_of_day=["09:00","18:00"], timezone asked
         ("Europe/London"), job_defaults={"total_length": 30}; summary "10 videos a week x 18
@@ -312,7 +325,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         )
         _require_confirmation(confirm, "Creating an Autopilot series")
         await _priced_defaults(backend, job_defaults, theme)
-        return _dict_result(await _api(backend, "POST", "/api/workflows", body=body))
+        return _with_next(
+            await _api(backend, "POST", "/api/workflows", body=body),
+            "Series created; nothing is posted yet. Tell the user when the first video is due "
+            "(next_slot_at) and that each video spends credits when it is made.",
+        )
 
     @server.tool(
         title="Update Autopilot series",
@@ -343,10 +360,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         confirm: Confirm = False,
     ) -> dict[str, Any]:
         """Use when the user wants to change an Autopilot series, after they review the change.
-        job_defaults is merged into the current video settings, so pass only what changes.
 
-        Changing the cadence or generation brief causes the backend to drop planned slots and
-        re-plan them. Show that consequence before calling. Omitted fields stay unchanged.
+        Do: pass only what changes (omitted fields stay; job_defaults is merged into the
+        current settings). Before changing days, times, timezone or theme, say that planned
+        videos will be re-planned.
+        Don't: use it to pause, resume or stop; those have their own tools.
+        Returns: the updated series and ``next_step``.
         """
         _check_timezone(timezone)
         _check_ends_at(ends_at)
@@ -376,7 +395,10 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             current = _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
             body["job_defaults"] = {**_JOB_DEFAULTS, **(current.get("job_defaults") or {}), **job_defaults}
             await _priced_defaults(backend, body["job_defaults"], theme or current.get("theme"))
-        return _dict_result(await _api(backend, "PATCH", f"/api/workflows/{series_id}", body=body))
+        return _with_next(
+            await _api(backend, "PATCH", f"/api/workflows/{series_id}", body=body),
+            "Updated. Check next_slot_at, or list_series_slots if the schedule changed.",
+        )
 
     @server.tool(
         title="Pause Autopilot series",
@@ -384,9 +406,17 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def pause_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Pause a series: no new videos are made and queued posts are held until resumed."""
+        """Use when the user wants a series to take a break without losing it.
+
+        No new videos are made and queued posts are held until resume_series.
+        Do: confirm which series by name. Don't: use stop_series for a temporary break.
+        Returns: the series with status "paused" and ``next_step``.
+        """
         _require_confirmation(confirm, "Pausing an Autopilot series")
-        return _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/pause"))
+        return _with_next(
+            await _api(backend, "POST", f"/api/workflows/{series_id}/pause"),
+            "Paused: nothing is made or posted until resume_series.",
+        )
 
     @server.tool(
         title="Resume Autopilot series",
@@ -398,10 +428,20 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         ends_at: Annotated[AwareDatetime | None, Field(description="Optional new timezone-aware end date.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Resume a paused or stopped series; it plans new videos from now on."""
+        """Use when the user wants a paused or stopped series to run again.
+
+        It plans new videos from now on; missed times are not made up.
+        Do: if it paused itself, read last_error (often credits) and fix the cause first; ask
+        for a new end date if the old one has passed.
+        Don't: resume when the user cannot afford the next video; show credits first.
+        Returns: the series with status "active", ``next_slot_at`` and ``next_step``.
+        """
         _require_confirmation(confirm, "Resuming an Autopilot series")
         body = _optional_params(ends_at=ends_at)
-        return _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/resume", body=body or None))
+        return _with_next(
+            await _api(backend, "POST", f"/api/workflows/{series_id}/resume", body=body or None),
+            "Running again. Tell the user when the next video is due (next_slot_at).",
+        )
 
     @server.tool(
         title="Stop Autopilot series",
@@ -409,9 +449,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def stop_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Stop a series and cancel its queued posts. Videos already made are kept."""
+        """Use when the user wants a series to end for good but keep its history.
+
+        Cancels its queued posts; videos already made and posts already published are kept.
+        Do: say queued posts will be cancelled and get approval.
+        Don't: use it for a temporary break (pause_series) or to remove it (delete_series).
+        Returns: the series with status "stopped" and ``next_step``.
+        """
         _require_confirmation(confirm, "Stopping an Autopilot series")
-        return _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/stop"))
+        return _with_next(
+            await _api(backend, "POST", f"/api/workflows/{series_id}/stop"),
+            "Stopped; nothing more will be made or posted. resume_series can restart it.",
+        )
 
     @server.tool(
         title="Delete Autopilot series",
@@ -420,10 +469,19 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def delete_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
-        """Delete a series and its schedule; its posts still waiting to go out are cancelled.
-        Published posts stay in list_posts. To keep the history visible, stop_series instead."""
+        """Use when the user wants a series removed entirely. Cannot be undone.
+
+        Its schedule is deleted and posts still waiting to go out are cancelled; published
+        posts stay in list_posts.
+        Do: name the series, say it cannot be undone, and get approval.
+        Don't: delete when the user only wants it to stop; stop_series keeps the history.
+        Returns: the backend's confirmation and ``next_step``.
+        """
         _require_confirmation(confirm, "Deleting an Autopilot series")
-        return _dict_result(await _api(backend, "DELETE", f"/api/workflows/{series_id}"))
+        return _with_next(
+            await _api(backend, "DELETE", f"/api/workflows/{series_id}"),
+            "Deleted. It no longer appears in list_series.",
+        )
 
     @server.tool(
         title="Update series slot",
@@ -438,7 +496,13 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         slot_at: Annotated[AwareDatetime | None, Field(description="Replacement timezone-aware posting time.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Edit one planned slot of a series (its idea, prompt, settings or time) before it is made."""
+        """Use when the user wants to change one upcoming video of a series: its idea, prompt,
+        settings or time.
+
+        Do: find the slot with list_series_slots and show the change first.
+        Don't: edit a slot that is already generating or posted; only planned slots change.
+        Returns: the updated slot.
+        """
         _require_confirmation(confirm, "Updating a series slot")
         body = _optional_params(
             title=_bounded_text(title, "title", 500),
@@ -461,20 +525,27 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         suggested_changes: Annotated[str | None, Field(max_length=1000, description="Optional guidance for a regenerated idea.")] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Skip, retry, or regenerate the idea of one series slot after explicit approval.
+        """Use when the user wants to skip one upcoming series video, retry a failed one, or get
+        a new idea for it.
 
-        Retry can cause a new generation attempt and regenerate_idea calls the backend idea
-        engine. A slot must still be eligible for the selected operation.
+        skip: that video is not made or posted. retry: makes a failed slot again and spends
+        its credits again. regenerate_idea: writes a new idea for a planned slot (guide it with
+        suggested_changes).
+        Do: read it with list_series_slots first and say the cost before a retry.
+        Don't: pass suggested_changes for skip or retry; don't retry a slot whose account is broken.
+        Returns: the updated slot and ``next_step``.
         """
         _require_confirmation(confirm, f"Series slot {action}")
         if action == "regenerate_idea":
             body = _optional_params(suggested_changes=_bounded_text(suggested_changes, "suggested_changes", 1000))
-            return _dict_result(await _api(
-                backend,
-                "POST",
-                f"/api/workflow-slots/{slot_id}/regenerate-idea",
-                body=body,
-            ))
+            return _with_next(
+                await _api(backend, "POST", f"/api/workflow-slots/{slot_id}/regenerate-idea", body=body),
+                "New idea written. Show it to the user; update_series_slot can still change it.",
+            )
         if suggested_changes is not None:
             raise ToolError("suggested_changes is only valid for regenerate_idea.")
-        return _dict_result(await _api(backend, "POST", f"/api/workflow-slots/{slot_id}/{action}"))
+        return _with_next(
+            await _api(backend, "POST", f"/api/workflow-slots/{slot_id}/{action}"),
+            "Skipped; this video will not be made." if action == "skip"
+            else "Queued again, not made yet. Check list_series_slots when the user asks.",
+        )

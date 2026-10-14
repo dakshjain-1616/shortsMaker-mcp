@@ -25,8 +25,10 @@ from ._common import (
     _clean_tags,
     _dedupe_ids,
     _dict_result,
+    _items,
     _optional_params,
     _require_confirmation,
+    _with_next,
 )
 
 
@@ -60,15 +62,49 @@ async def _check_destinations(
         )
 
 
+def _connections_next(connections: list[Any]) -> str | None:
+    if not connections:
+        return "No accounts are connected. Offer connect_account for YouTube, TikTok or Instagram."
+    broken = sorted({
+        str(c.get("platform")) for c in connections
+        if isinstance(c, dict) and c.get("status") not in (None, "active")
+    })
+    if broken:
+        return (
+            f"Not usable now: {', '.join(broken)} (see status and last_error). Offer "
+            "connect_account(platform) to reconnect; don't post or retry posts to them until fixed."
+        )
+    return None
+
+
+def _posts_next(posts: list[Any]) -> str | None:
+    if not posts:
+        return "No posts match. Videos are posted with publish_video."
+    if any(isinstance(p, dict) and p.get("status") == "failed" for p in posts):
+        return (
+            "Some posts failed: quote each one's last_error. If it is an account or auth problem, "
+            "reconnect with connect_account before control_post(action='retry')."
+        )
+    return None
+
+
 def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
         title="List connected social accounts",
         annotations=READ_ONLY,
         structured_output=True,
     )
-    async def list_connections() -> list[dict[str, Any]]:
-        """List the user's connected social accounts without exposing provider access tokens."""
-        return await _api(backend, "GET", "/api/connections")
+    async def list_connections() -> dict[str, Any]:
+        """Use when you need the user's YouTube, TikTok or Instagram accounts: before posting,
+        creating a series, or when they ask what is connected.
+
+        Do: show each account as "name (platform)"; follow ``next_step`` when present.
+        Don't: post to an account whose status is not active; reconnect it with connect_account.
+        Returns: ``items`` (id, platform, account_name, status, last_error), ``count`` and,
+        when there is nothing usable, a ``next_step``. Never includes provider tokens.
+        """
+        out = _items(await _api(backend, "GET", "/api/connections"))
+        return _items(out["items"], _connections_next(out["items"]))
 
     @server.tool(
         title="List my posts",
@@ -82,11 +118,20 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         ] = None,
         job_id: Annotated[UUID | None, Field(description="Optional video job filter.")] = None,
         updated_since: Annotated[datetime | None, Field(description="Optional timezone-aware update cutoff.")] = None,
-    ) -> list[dict[str, Any]]:
-        """List the user's posts to YouTube, TikTok and Instagram and whether each is scheduled, posting, posted or failed."""
+    ) -> dict[str, Any]:
+        """Use when the user asks whether a video was posted, what is scheduled, or why a post failed.
+
+        Do: report each post's status as-is: only "published" means it is live; "scheduled"
+        and "publishing" are still waiting. Quote ``last_error`` for failed posts.
+        Don't: say a post is live from publish_video's result; check here when the user asks,
+        without polling in a loop.
+        Returns: ``items`` (id, job_id, connection_id, platform, status, scheduled_at,
+        last_error), ``count`` and a ``next_step`` when there are none or some failed.
+        """
         params = _optional_params(status=status, job_id=job_id, updated_since=updated_since)
         params["summary"] = "true"
-        return await _api(backend, "GET", "/api/posts", params=params)
+        out = _items(await _api(backend, "GET", "/api/posts", params=params))
+        return _items(out["items"], _posts_next(out["items"]))
 
     @server.tool(
         title="Check posting service",
@@ -94,7 +139,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def check_publishing_health() -> dict[str, Any]:
-        """Check whether the asynchronous publishing worker is alive and processing the user's queue."""
+        """Use when posts seem stuck in "scheduled" or "publishing" past their time.
+
+        Do: tell the user in plain words whether posting is working.
+        Don't: call it before every post; it is a diagnostic, not a precondition.
+        Returns: whether the publishing worker is alive and processing the queue.
+        """
         return _dict_result(await _api(backend, "GET", "/api/publishing/health"))
 
     @server.tool(
@@ -109,13 +159,21 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Use when the user wants to connect (or reconnect) a YouTube, TikTok or Instagram
         account. Returns a sign-in link for the user to open in their browser.
 
-        The link expires in about 10 minutes. Never ask for passwords or tokens in chat.
-        Calling it for a platform whose account shows status "error" repairs that connection.
+        Do: give the user the link, say it expires in about 10 minutes, and call
+        list_connections after they say they are done. Calling it for a platform whose account
+        shows status "error" repairs that connection.
+        Don't: ask for passwords or tokens in chat, or say the account is connected before
+        list_connections shows it.
+        Returns: the sign-in link and a ``next_step``.
         Example: "connect my TikTok" -> connect_account("tiktok", confirm=true); reply "Open this
         link and approve, then tell me when you're done", then call list_connections to check.
         """
         _require_confirmation(confirm, f"Connecting a {platform} account")
-        return _dict_result(await _api(backend, "POST", f"/api/connections/{platform}/authorize"))
+        return _with_next(
+            await _api(backend, "POST", f"/api/connections/{platform}/authorize"),
+            "Not connected yet. Give the user the link (expires in ~10 minutes); when they say "
+            "they are done, check with list_connections.",
+        )
 
     @server.tool(
         title="Disconnect social account",
@@ -126,10 +184,13 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         connection_id: ConnectionId,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Disconnect one owned social account and cancel its still-queued posts.
+        """Use when the user wants to remove a connected social account.
 
-        This destroys the stored provider tokens and is not reversible through this tool. Require
-        the user to confirm the account name and platform before calling with confirm=true.
+        It cancels that account's still-queued posts and deletes the stored sign-in; reconnecting
+        needs connect_account again. Published posts stay published.
+        Do: name the account and platform and say queued posts will be cancelled, then get approval.
+        Don't: use it to fix a broken account; connect_account repairs it in place.
+        Returns: the backend's confirmation.
         """
         _require_confirmation(confirm, "Social-account disconnect")
         return _dict_result(await _api(backend, "DELETE", f"/api/connections/{connection_id}"))
@@ -166,14 +227,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             Field(description="True only if the user explicitly wants this video posted again to an account it already went to."),
         ] = False,
         confirm: Confirm = False,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Use when the user has approved posting a finished video to their connected accounts.
 
-        Before calling, check the video is ready (get_video), show the account names,
-        platforms, visibility, time (with timezone), title and description, and get explicit
-        approval. The result means queued, not posted: check list_posts for the outcome.
-        Refuses to post a video again to an account it already went to unless allow_repost.
-        If a timed-out call is retried, check list_posts first.
+        Do: check the video is ready (get_video); show the account names, platforms,
+        visibility, time (with timezone), title and description; get explicit approval. For
+        TikTok, ask who can see it. If a call timed out, check list_posts before calling again.
+        Don't: post an unfinished video, post to an account whose status is not active, guess
+        the timezone, or set allow_repost unless the user asked to post it again.
+        Returns: ``items`` (one post per account: id, status "scheduled"/"publishing" = queued,
+        NOT posted), ``count`` and ``next_step``.
         Example: "post my cooking video to YouTube tomorrow 9am" -> list_videos(query="cooking"),
         list_connections, ask their timezone if unknown, show "MyChannel (YouTube), public,
         Tue 09:00 America/Chicago, title ...", then publish_video(job_id, [youtube_id],
@@ -186,7 +249,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             job_id=job_id,
             connection_ids=_dedupe_ids(connection_ids),
             scheduled_at=scheduled_at,
-            title=_bounded_text(title, "title", 500),
+            title=_bounded_text(title, "title", 100),
             description=description.strip() if description is not None else None,
             tags=_clean_tags(tags),
             visibility=visibility,
@@ -194,7 +257,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         _require_confirmation(confirm, "Publishing")
         await _check_destinations(backend, job_id, set(body["connection_ids"]), visibility, allow_repost)
         result = await _api(backend, "POST", "/api/posts", body=body)
-        return result if isinstance(result, list) else [_dict_result(result)]
+        return _items(
+            result if isinstance(result, list) else [_dict_result(result)],
+            "Queued, not posted. Tell the user when it will go out; check list_posts(job_id=...) "
+            "when they ask.",
+        )
 
     @server.tool(
         title="Cancel or retry a post",
@@ -208,8 +275,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     ) -> dict[str, Any]:
         """Use when the user wants to cancel a waiting post or retry a failed or cancelled one.
 
-        A post already being uploaded cannot be recalled. Retrying creates a new publishing
-        attempt and should happen only after the user understands the destination and prior error.
+        Do: read it with list_posts first; before a retry, show the destination and the
+        earlier last_error.
+        Don't: retry a post whose account shows an error (reconnect with connect_account
+        first), or try to cancel one already "publishing": it cannot be recalled.
+        Returns: the post's new status plus ``next_step``.
         """
         _require_confirmation(confirm, f"Publishing post {action}")
-        return _dict_result(await _api(backend, "POST", f"/api/posts/{post_id}/{action}"))
+        return _with_next(
+            await _api(backend, "POST", f"/api/posts/{post_id}/{action}"),
+            "Cancelled; it will not be posted." if action == "cancel"
+            else "Queued again, not posted. Check list_posts when the user asks.",
+        )

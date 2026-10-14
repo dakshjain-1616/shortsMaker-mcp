@@ -17,10 +17,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def get_credits() -> dict[str, Any]:
-        """Read the signed-in user's current credit balance and recent credit status.
+        """Use when the user asks how many credits they have, or a price needs checking against the balance.
 
-        This MCP cannot buy credits or change billing. If the balance is too low, tell the user to
-        add credits on the website (the billing link is in the server instructions).
+        Do: if the balance is too low, give the billing link from the server instructions.
+        Don't: offer to buy credits; this connector cannot buy credits or change billing.
+        Returns: ``balance`` and recent credit status.
         """
         return _dict_result(await _api(backend, "GET", "/api/payments/credit-status"))
 
@@ -30,7 +31,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def get_subscription() -> dict[str, Any]:
-        """Read the signed-in user's current subscription, renewal, and cancellation status."""
+        """Use when the user asks about their plan, renewal date or cancellation.
+
+        Don't: offer to change or cancel it; that happens on the website (billing link).
+        Returns: current subscription, renewal and cancellation status.
+        """
         return _dict_result(await _api(backend, "GET", "/api/payments/subscription"))
 
     @server.tool(
@@ -39,8 +44,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def list_plans() -> dict[str, Any]:
-        """List active subscription plans and prices. Read-only: plan changes and payments are done by
-        the user on the website (the billing link is in the server instructions), not through this MCP."""
+        """Use when the user asks what plans exist or what they cost.
+
+        Don't: offer to subscribe or pay; plan changes and payments are done on the website
+        (the billing link is in the server instructions).
+        Returns: active plans and prices.
+        """
         return _dict_result(await _api(backend, "GET", "/api/payments/plans"))
 
     @server.tool(
@@ -49,5 +58,9 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         structured_output=True,
     )
     async def get_account_features() -> dict[str, Any]:
-        """Read account-level product feature flags used by the Faceless Video Maker composer."""
+        """Use when a choice from get_video_options seems unavailable to this account.
+
+        Don't: call it for normal video making; get_video_options already has the choices.
+        Returns: the account's product feature flags.
+        """
         return _dict_result(await _api(backend, "GET", "/api/features"))

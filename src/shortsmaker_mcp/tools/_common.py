@@ -88,17 +88,12 @@ IDEMPOTENT_WRITE = ToolAnnotations(
 # the tools that spend credits, post publicly or delete. Other clients ignore it.
 ASK_EVERY_TIME = {"anthropic/requiresUserInteraction": True}
 
-def _json_default(value: Any) -> str:
+def _json_value(value: Any) -> Any:
+    """Convert values to the JSON-safe representation expected by httpx."""
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, UUID):
         return str(value)
-    raise TypeError(f"Cannot serialize {type(value).__name__}")
-
-def _json_value(value: Any) -> Any:
-    """Convert values to the JSON-safe representation expected by httpx."""
-    if isinstance(value, (datetime, UUID)):
-        return _json_default(value)
     if isinstance(value, list):
         return [_json_value(item) for item in value]
     if isinstance(value, dict):
@@ -153,6 +148,16 @@ def _dedupe_ids(connection_ids: list[UUID]) -> list[str]:
 def _dict_result(result: Any) -> dict[str, Any]:
     return result if isinstance(result, dict) else {"result": result}
 
+def _with_next(result: Any, next_step: str) -> dict[str, Any]:
+    """Tell the agent what this result means and what to do next, so it never reports a queued
+    write as done."""
+    return {**_dict_result(result), "next_step": next_step}
+
+def _items(result: Any, next_step: str | None = None) -> dict[str, Any]:
+    """Lists go out as an object so an empty or problem state can carry a next step."""
+    items = result if isinstance(result, list) else []
+    return {"items": items, "count": len(items), **({"next_step": next_step} if next_step else {})}
+
 _URL = re.compile(r"https?://\S+")
 
 # Fallbacks for when the backend gives no sentence of its own. 401/403/429/5xx always use these:
@@ -169,6 +174,7 @@ _FALLBACK = {
 _NEXT_STEP = {
     402: f" Show the user the price and their balance (get_credits). They can add credits at {BILLING_URL}; you cannot buy credits.",
     404: " Use the matching list tool (list_videos, list_series, list_posts, list_connections) to find a valid id.",
+    409: " Read the item (get_video, get_series or list_posts) and tell the user its status and last_error; don't retry blindly.",
 }
 
 
