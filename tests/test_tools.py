@@ -274,7 +274,7 @@ def test_workflow_prompts_require_preview_and_confirmation():
     assert "queued, not that it has already been uploaded" in publish_text
     assert "planned work" in workflow_prompt.fn(UUID(int=0))[0]["content"]["text"]
     # Without arguments the guided prompts start by asking, one question at a time.
-    assert "ask me what it should be about" in create_prompt.fn()[0]["content"]["text"]
+    assert "offer 3-4" in create_prompt.fn()[0]["content"]["text"]
     assert "one short question at a time" in series_text
     assert "list_connections" in series_text and "confirm=true" in series_text
 

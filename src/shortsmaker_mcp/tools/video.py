@@ -219,7 +219,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns the settings the video will really use, ``estimated_credits``, the user's
         ``balance`` and ``can_afford``. Pass the topic as ``niche`` so Auto resolves to the real
         format and price. If can_afford is false, do not ask for approval: show the price and
-        balance and point the user to https://facelessvideomaker.ai to add credits.
+        balance and give the billing link from the server instructions.
         The ``credits_cost`` that create_video returns is the exact charge. Never holds credits.
         """
         params = _resolve_params(

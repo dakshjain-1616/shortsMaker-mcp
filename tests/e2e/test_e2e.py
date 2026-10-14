@@ -249,7 +249,7 @@ def test_server_identity_carries_brand_and_icons(stack):
     headers = {**MCP_HEADERS, "Authorization": f"Bearer {oauth_token(stack)}"}
     info = httpx.post(f"{stack['mcp']}/mcp/", headers=headers, json=INIT).json()["result"]["serverInfo"]
     assert info["title"] == "Faceless Video Maker"
-    assert info["websiteUrl"] == "https://facelessvideomaker.ai"
+    assert info["websiteUrl"] == "https://stage.facelessvideomaker.ai"  # MCP_APP_URL default
     icon_urls = [icon["src"] for icon in info["icons"]]
     assert all(url.startswith("http") for url in icon_urls)
     for url in icon_urls:
@@ -269,6 +269,7 @@ def test_gallery_is_linked_from_list_tools_and_served(stack):
     page = run(stack, lambda c: c.read_resource(GALLERY_URI)).contents[0]
     assert page.mime_type == "text/html;profile=mcp-app"
     assert "ui/initialize" in page.text and ".innerHTML" not in page.text  # titles are user content
+    assert "__APP_URL__" not in page.text and "https://stage.facelessvideomaker.ai" in page.text
 
 
 def test_gallery_flag_follows_client_support(stack):
