@@ -128,6 +128,17 @@ async def api(request: Request):
                              "total_length": min(asked, 60.0), "requested_length": asked})
     if path == "/api/jobs" and request.method == "POST":
         return await create_job(request, user, body or {})
+    if path.startswith("/api/jobs/") and path.endswith("/retry") and request.method == "POST":
+        # Like the real API: a failed or cancelled video is charged again, a paused one is free.
+        job = JOBS.get(path.split("/")[3])
+        if not job or job["owner"] != user:
+            return JSONResponse({"detail": "Job not found"}, status_code=404)
+        if job["status"] not in ("failed", "cancelled", "paused"):
+            return JSONResponse({"detail": f"Cannot resume a job that is {job['status']}"}, status_code=409)
+        if job["status"] != "paused":
+            CREDITS[user] -= job["credits_cost"]
+        job["status"] = "pending"
+        return JSONResponse({"status": "queued"})
     if path == "/api/jobs" and request.method == "GET":
         # newest first, like the real backend
         return JSONResponse([j for j in reversed(JOBS.values()) if j["owner"] == user])

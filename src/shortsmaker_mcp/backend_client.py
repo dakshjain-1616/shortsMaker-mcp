@@ -22,10 +22,12 @@ class BackendUnavailable(Exception):
 class BackendAPIError(Exception):
     """The Platform API returned a deliberate HTTP error."""
 
-    def __init__(self, status_code: int, detail: str):
+    def __init__(self, status_code: int, detail: str, retry_after: int | None = None):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        # Seconds from the Retry-After header (429, 503), so the user hears how long to wait.
+        self.retry_after = retry_after
 
 
 class BackendClient:
@@ -99,5 +101,8 @@ class BackendClient:
                 # FastAPI validation errors: a list of {"loc": [...], "msg": "..."}.
                 detail = "; ".join(str(item.get("msg")) for item in detail if isinstance(item, dict)) or None
             message = detail if isinstance(detail, str) else f"Request failed ({response.status_code})."
-            raise BackendAPIError(response.status_code, message[:500])
+            retry_after = response.headers.get("retry-after", "")
+            raise BackendAPIError(
+                response.status_code, message[:500], int(retry_after) if retry_after.isdigit() else None,
+            )
         return result

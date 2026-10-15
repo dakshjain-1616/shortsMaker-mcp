@@ -297,6 +297,15 @@
         setStatus(successMessage, "success");
       }
 
+      // Money-spending tools preview first; the checkbox is the approval, so confirm with its token.
+      async function callApproved(name, argumentsValue, successMessage) {
+        if (!sessionId) await initializeSession();
+        const preview = await rpc("tools/call", { name, arguments: argumentsValue }, 2);
+        const previewToken = preview && preview.structuredContent && preview.structuredContent.preview_token;
+        if (!previewToken) return displayToolResult(preview);
+        return callTool(name, { ...argumentsValue, preview_token: previewToken, confirm: true }, successMessage);
+      }
+
       async function runAction(action) {
         actionButtons.forEach((button) => { button.disabled = true; });
         setStatus("Calling MCP…");
@@ -405,19 +414,17 @@
           niche: requiredValue("create-niche", "Topic or niche"),
           total_length: lengthValue,
           idempotency_key: requiredValue("create-idempotency", "Idempotency key"),
-          confirm: true,
         };
-        return callTool("create_video", argumentsValue, "Video job submitted to staging.")
+        return callApproved("create_video", argumentsValue, "Video job submitted to staging.")
           .then(() => { document.getElementById("create-idempotency").value = newIdempotencyKey(); });
       });
 
       document.getElementById("control-video").onclick = () => runAction(() => {
         if (!checked("control-confirm")) throw new Error("Check the video-action confirmation first.");
-        return callTool("control_video", {
-          job_id: requiredValue("control-job-id", "Job UUID"),
-          action: document.getElementById("control-action").value,
-          confirm: true,
-        }, "Video action submitted to staging.");
+        const jobId = requiredValue("control-job-id", "Job UUID");
+        const action = document.getElementById("control-action").value;
+        if (action === "retry") return callApproved("retry_video", { job_id: jobId }, "Video retry submitted to staging.");
+        return callTool("control_video", { job_id: jobId, action, confirm: true }, "Video action submitted to staging.");
       });
 
       document.getElementById("update-metadata").onclick = () => runAction(() => {

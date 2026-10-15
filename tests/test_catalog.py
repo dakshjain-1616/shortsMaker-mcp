@@ -98,12 +98,13 @@ def test_create_video_refuses_unknown_voice_before_charging():
     backend.request.side_effect = _routes({**PRICED, "/api/config": config})
     create = registered["create_video"].fn
     with pytest.raises(ToolError, match="'atlas' is not offered.*kore.*Nothing was charged"):
-        _run(create("space", 30, narrator_voice="atlas", expected_credits=18, confirm=True))
+        _run(create("space", 30, narrator_voice="atlas", preview_token="p-any", confirm=True))
     assert all(c.args[0] == "GET" for c in backend.request.await_args_list)
 
     # A config without the list (older engine) does not block the choice.
     backend.request.side_effect = _routes(PRICED)
-    assert _run(create("space", 30, narrator_voice="atlas", expected_credits=18, confirm=True))["status"] == "queued"
+    token = _run(create("space", 30, narrator_voice="atlas"))["preview_token"]
+    assert _run(create("space", 30, narrator_voice="atlas", preview_token=token, confirm=True))["status"] == "queued"
 
 
 def test_create_video_refuses_a_resolution_the_format_does_not_offer():

@@ -49,7 +49,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             "Then call create_video without confirm to get the preview and show me its summary, "
             "any adjustments and any warning, in plain words. Do not make anything until I say "
             "yes. After I approve, call create_video again with the same settings, confirm=true "
-            "and expected_credits from the preview, tell me it is being made and takes a few "
+            "and the preview_token from the preview, tell me it is being made and takes a few "
             "minutes, and check it with get_video when I ask.\n"
             "Handle these cases: if my topic is vague (\"make me a viral video\"), offer 3 concrete "
             "topics first. If the preview says I can't afford it, show the price, my balance and "

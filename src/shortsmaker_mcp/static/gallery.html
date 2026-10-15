@@ -69,6 +69,8 @@
   .slot { padding: 10px 12px; }
   .slot .when { color: var(--accent); font-weight: 600; font-size: 12px; margin-bottom: 2px; }
   :root[data-theme="light"] .slot .when { color: var(--text); }
+  .slot .meta { margin-top: 4px; font-size: 12px; color: var(--muted); }
+  .section { color: var(--muted); font-size: 12px; font-weight: 600; margin: 14px 0 6px; }
   .slot .idea { margin-top: 4px; color: var(--muted); font-size: 12px; display: -webkit-box;
                 -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   @media (prefers-reduced-motion: no-preference) { .bar span { transition: width .4s ease; } }
@@ -239,15 +241,29 @@ function render(data) {
   if (Array.isArray(data.items) && data.series_name) {
     // Upcoming videos of one series: when, title and idea, so the user can review before they are made.
     openTarget = APP_URL + "/dashboard/workflows";
-    const list = el("div", "upcoming");
-    data.items.forEach((slot) => {
-      const row = el("article", "card slot");
-      row.append(el("div", "when", slot.when || ""), el("div", "title", slot.title || "Idea not written yet"));
-      if (slot.prompt) row.append(el("div", "idea", slot.prompt));
-      if (slot.last_error) row.append(el("div", "idea s-red", slot.last_error));
-      list.append(row);
-    });
-    root.append(data.items.length ? list : el("div", "empty", "Nothing upcoming in " + data.series_name + " right now."));
+    // Every word comes from the server (status_label, posting, next_try, fix), so the gallery
+    // and the assistant describe a video the same way.
+    const slotList = (slots) => {
+      const list = el("div", "upcoming");
+      slots.forEach((slot) => {
+        const row = el("article", "card slot");
+        row.append(el("div", "when", slot.when || ""), el("div", "title", slot.title || "Idea not written yet"));
+        if (slot.prompt) row.append(el("div", "idea", slot.prompt));
+        const meta = [];
+        if (slot.video) meta.push("Video: " + slot.video);
+        (slot.posting || []).forEach((p) => meta.push(p.account + ": " + p.status_label));
+        if (slot.next_try) meta.push("Trying again " + slot.next_try + (slot.tries ? " (" + slot.tries + ")" : ""));
+        if (meta.length) row.append(el("div", "meta", meta.join(" · ")));
+        if (slot.last_error) row.append(el("div", "idea s-red", slot.last_error));
+        if (slot.fix) row.append(el("div", "meta s-orange", slot.fix));
+        list.append(row);
+      });
+      return list;
+    };
+    root.append(data.items.length ? slotList(data.items) : el("div", "empty", "Nothing upcoming in " + data.series_name + " right now."));
+    if (Array.isArray(data.needs_attention) && data.needs_attention.length) {
+      root.append(el("div", "section", "Needs attention (last 7 days)"), slotList(data.needs_attention));
+    }
     return;
   }
 
