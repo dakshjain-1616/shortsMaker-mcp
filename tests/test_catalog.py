@@ -86,25 +86,34 @@ def test_list_posts_flags_failures():
 def test_publish_title_over_100_is_refused_before_any_call():
     registered, backend = _server()
     with pytest.raises(ToolError, match="100 characters"):
-        _run(registered["publish_video"].fn(ID, [ID], title=" " + "x" * 101 + " ", confirm=True))
+        _run(registered["publish_video"].fn(ID, [ID], "public", title=" " + "x" * 101 + " ", confirm=True))
     backend.request.assert_not_awaited()
 
 
 def test_create_video_refuses_unknown_voice_before_charging():
+    from tests.test_tools import PRICED, _routes
+
     registered, backend = _server()
-    backend.request.return_value = {
-        "styles": ["cinematic"],
-        "audio": {"voices": [{"id": "kore"}], "music_tracks": [{"id": "calm-piano"}]},
-    }
+    config = {"styles": ["cinematic"], "audio": {"voices": [{"id": "kore"}], "music_tracks": [{"id": "calm-piano"}]}}
+    backend.request.side_effect = _routes({**PRICED, "/api/config": config})
     create = registered["create_video"].fn
     with pytest.raises(ToolError, match="'atlas' is not offered.*kore.*Nothing was charged"):
-        _run(create("space", 30, "k1", narrator_voice="atlas", confirm=True))
-    assert [c.args[:2] for c in backend.request.await_args_list] == [("GET", "/api/config")]
+        _run(create("space", 30, narrator_voice="atlas", expected_credits=18, confirm=True))
+    assert all(c.args[0] == "GET" for c in backend.request.await_args_list)
 
     # A config without the list (older engine) does not block the choice.
-    backend.request.reset_mock()
-    backend.request.side_effect = [{}, {"id": "j", "status": "queued"}]
-    assert _run(create("space", 30, "k2", narrator_voice="atlas", confirm=True))["status"] == "queued"
+    backend.request.side_effect = _routes(PRICED)
+    assert _run(create("space", 30, narrator_voice="atlas", expected_credits=18, confirm=True))["status"] == "queued"
+
+
+def test_create_video_refuses_a_resolution_the_format_does_not_offer():
+    from tests.test_tools import PRICED, _routes
+
+    registered, backend = _server()
+    config = {"resolutions_by_format": {"pov": {"available": ["720p"], "default": "720p"}}}
+    backend.request.side_effect = _routes({**PRICED, "/api/config": config})
+    with pytest.raises(ToolError, match="doesn't offer resolution '1080p'; it offers 720p"):
+        _run(registered["create_video"].fn("space", 30, format="pov", resolution="1080p"))
 
 
 @pytest.mark.parametrize(
@@ -127,7 +136,8 @@ def test_confirmed_writes_hit_the_route_and_say_what_happens_next(name, args, me
     registered, backend = _server()
     backend.request.return_value = {"ok": True}
     result = _run(registered[name].fn(*args, confirm=True))
-    assert backend.request.await_args.args[:2] == (method, path)
+    writes = [c.args[:2] for c in backend.request.await_args_list if c.args[0] != "GET"]
+    assert writes == [(method, path)]  # reads around the write are fine; exactly one write
     assert next_word in result["next_step"]
 
 
@@ -137,7 +147,7 @@ def test_slot_and_metadata_writes_refuse_empty_or_misplaced_fields():
         _run(registered["control_series_slot"].fn(ID, "skip", "funnier", confirm=True))
     with pytest.raises(ToolError, match="at least one slot field"):
         _run(registered["update_series_slot"].fn(ID, confirm=True))
-    with pytest.raises(ToolError, match="at least one metadata field"):
+    with pytest.raises(ToolError, match="at least one detail to change"):
         _run(registered["update_video_details"].fn(ID, confirm=True))
     backend.request.assert_not_awaited()
 

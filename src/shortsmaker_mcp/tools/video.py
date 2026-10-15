@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
@@ -12,22 +14,27 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from ..backend_client import BackendClient
+from ..config import BILLING_URL
 from ._common import (
     ASK_EVERY_TIME,
     IDEMPOTENT_WRITE,
     READ_ONLY,
     WRITE,
     Confirm,
-    IdempotencyKey,
     JobId,
     Niche,
     _api,
     _bounded_text,
     _clean_tags,
     _dict_result,
+    _label,
     _optional_params,
+    _parse_time,
     _require_confirmation,
+    _video_ref,
+    _when,
     _with_next,
+    _words,
 )
 from .gallery import GALLERY_META, shown_as_gallery
 
@@ -80,48 +87,161 @@ def _create_params(
         idempotency_key=_bounded_text(idempotency_key, "idempotency_key", 200, required=True),
     )
 
-def _job_summary(job: dict[str, Any]) -> dict[str, Any]:
-    """The fields a person cares about; ``progress`` (0-1) becomes ``progress_pct`` (0-100)."""
-    summary = _job_fields(job)
-    if "progress" in summary:
-        summary["progress_pct"] = round((summary.pop("progress") or 0) * 100)
-    return summary
+_IN_PROGRESS = {"queued", "pending", "processing", "paused"}
+_DONE = {"ready", "complete"}
 
 
-def _job_fields(job: dict[str, Any]) -> dict[str, Any]:
-    keys = (
-        "id",
-        "status",
-        "niche",
-        "format",
-        "progress",
-        "active_stage",
-        "error",
-        "credits_cost",
-        "title",
-        "description",
-        "tags",
-        "has_video",
-        "video_url",
-        "thumbnail_urls",
-        "created_at",
-        "updated_at",
-    )
-    return {key: job.get(key) for key in keys if key in job}
+def _thumbnail(job: dict[str, Any]) -> str | None:
+    thumbs = job.get("thumbnail_urls") if isinstance(job.get("thumbnail_urls"), dict) else {}
+    return thumbs.get("after") or thumbs.get("mid") or thumbs.get("before")
 
 
-async def _quote(backend: BackendClient, params: dict[str, Any]) -> dict[str, Any]:
-    """The engine's price for these settings plus whether the user can afford it right now."""
-    quote, credits = await asyncio.gather(
+def _auto_key(body: dict[str, Any]) -> str:
+    """The same settings always give the same key, so a retried call after a timeout returns the
+    first video instead of charging again. The backend keeps keys forever, so asking for the very
+    same video later replays it too; the result says so and a new key makes a deliberate copy."""
+    settings = {key: value for key, value in body.items() if key != "idempotency_key"}
+    return "auto-" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:40]
+
+
+def _job_summary(job: dict[str, Any], *, full: bool = False) -> dict[str, Any]:
+    """A video as a person sees it. Lists get a slim row (one thumbnail, link only when ready);
+    ``full`` adds the topic, description, tags and dates for a single-video read."""
+    status = job.get("status")
+    topic = job.get("niche") or ""
+    row: dict[str, Any] = {
+        "id": job.get("id"),
+        "title": job.get("title") or (topic[:80] + ("…" if len(topic) > 80 else "")) or "Untitled video",
+        "status": status,
+        "status_label": _label(status),
+    }
+    if status in _IN_PROGRESS:
+        row["progress_pct"] = round((job.get("progress") or 0) * 100)
+        if job.get("active_stage"):
+            row["active_stage"] = job["active_stage"]
+    for key in ("format", "credits_cost"):
+        if job.get(key) is not None:
+            row[key] = job[key]
+    if job.get("created_at"):
+        row["created"] = _when(job["created_at"])
+    if _thumbnail(job):
+        row["thumbnail"] = _thumbnail(job)
+    if status in _DONE and job.get("video_url"):
+        row["video_url"] = job["video_url"]
+    if full:
+        for key in ("niche", "description", "error", "updated_at"):
+            if job.get(key):
+                row[key] = job[key]
+        if isinstance(job.get("tags"), list):
+            row["tags"] = job["tags"][:15]
+    return row
+
+
+def _videos_summary(videos: list[dict[str, Any]], total: int, hidden: dict[str, int]) -> str:
+    if not videos:
+        text = "No more videos past this point." if total else "No videos here yet."
+    else:
+        counts: dict[str, int] = {}
+        for row in videos:
+            counts[row["status_label"]] = counts.get(row["status_label"], 0) + 1
+        parts = ", ".join(f"{n} {label.lower()}" for label, n in counts.items())
+        text = f"Showing {len(videos)} of {total} video{'' if total == 1 else 's'}: {parts}."
+    hidden_total = sum(hidden.values())
+    if hidden_total:
+        text += f" {hidden_total} that didn't finish or were cancelled are hidden."
+    return text
+
+
+def _video_line(row: dict[str, Any]) -> str:
+    extra = f" ({row['progress_pct']}%)" if "progress_pct" in row and row["status"] != "paused" else ""
+    return f"\"{row['title']}\": {row['status_label']}{extra}"
+
+
+_SOUND = {"dialogue": "dialogue", "narration": "narration", "ambient": "natural sound", "silent": "music only"}
+
+
+def _adjustments(requested: dict[str, Any], quote: dict[str, Any]) -> list[str]:
+    """What the engine quietly changed from what was asked, in words the user understands."""
+    changes = []
+    asked, got = quote.get("requested_length") or requested.get("total_length"), quote.get("total_length")
+    if isinstance(asked, int | float) and isinstance(got, int | float) and asked != got:
+        changes.append(f"Length changed from {asked:g}s to {got:g}s, the closest this format allows.")
+    asked, got = requested.get("audio_mode"), quote.get("audio_mode")
+    if asked and got and asked != got:
+        changes.append(
+            f"Sound changed from {_SOUND.get(asked, asked)} to {_SOUND.get(got, got)}, "
+            "because this format can't do the first."
+        )
+    asked, got = requested.get("resolution"), quote.get("resolution")
+    if asked and got and asked != got:
+        changes.append(f"Resolution changed from {asked} to {got}.")
+    return changes
+
+
+def _recent_failures(jobs: Any, now: datetime) -> int:
+    """Videos that failed in the last hour: a sign the next one will fail too."""
+    count = 0
+    for job in jobs if isinstance(jobs, list) else []:
+        if not isinstance(job, dict) or job.get("status") != "failed":
+            continue
+        when = _parse_time(job.get("updated_at") or job.get("created_at"))
+        if when and (now - when).total_seconds() < 3600:
+            count += 1
+    return count
+
+
+async def _quote(
+    backend: BackendClient, params: dict[str, Any], body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The price and settings the engine will really use, checked against what the user asked.
+
+    Also checks style/voice/music/resolution/sound against the catalogue (``body``, the create
+    settings, defaults to ``params``) so a bad choice fails here, before any credits are held.
+    """
+    now = datetime.now(UTC)
+    config, quote, credits, jobs = await asyncio.gather(
+        _api(backend, "GET", "/api/config"),
         _api(backend, "GET", "/api/resolve", params=params),
         _api(backend, "GET", "/api/payments/credit-status"),
+        # Only the last hour matters for the failure warning; skip the other 200 rows' signed URLs.
+        _api(backend, "GET", "/api/jobs", params={"updated_since": (now - timedelta(hours=1)).isoformat()}),
     )
+    _check_choices(config, body or params)
     quote = {key: value for key, value in _dict_result(quote).items() if key != "estimated_cost"}
+    adjustments = _adjustments(params, quote)
+    if adjustments:
+        quote["adjustments"] = adjustments
     balance = credits.get("balance") if isinstance(credits, dict) else None
     needed = quote.get("estimated_credits")
     if isinstance(balance, int | float) and isinstance(needed, int | float):
         quote.update(balance=balance, can_afford=balance >= needed)
+        if balance < needed:
+            summary = (f"This video costs {needed:,} credits but you have {balance:,}. "
+                       f"You can add credits at {BILLING_URL}.")
+        else:
+            count = int(balance // needed) if needed else 0
+            summary = f"This video costs {needed:,} credits. You have {balance:,}, enough for about {count} like this."
+        quote["summary"] = " ".join([summary, *adjustments])
+    failures = _recent_failures(jobs, now)
+    if failures >= 2:
+        quote["warning"] = (
+            f"{failures} of your videos failed in the last hour. Credits come back when a video fails, "
+            "but this one will likely fail too. It may be better to wait a little."
+        )
     return quote
+
+
+def _plain_choices(config: Any) -> dict[str, list[dict[str, str]]]:
+    """Formats and quality levels as the user should hear them: a label and one plain line."""
+    config = config if isinstance(config, dict) else {}
+
+    def lines(items: Any, text_key: str) -> list[dict[str, str]]:
+        return [
+            {"id": str(item["id"]), "say": f"{item.get('label') or item['id']}: {item.get(text_key) or ''}".rstrip(": ")}
+            for item in items if isinstance(item, dict) and item.get("id")
+        ] if isinstance(items, list) else []
+
+    return {"formats": lines(config.get("formats"), "desc"), "quality": lines(config.get("modes"), "description")}
 
 
 def _strip_previews(value: Any) -> Any:
@@ -138,6 +258,64 @@ _CONTROL_NEXT = {
     "pause": "Pause requested; the credits stay held. control_video(action='retry') resumes it for free.",
     "retry": "Requeued, not ready. Check with get_video when the user asks; do not poll in a loop.",
 }
+
+
+# Cancel or pause on a running video answers "cancelling"/"pausing", then the video reads as
+# "processing" until the worker stops (seconds, normally). Wait that out so the user hears the end
+# state. ponytail: ~30s cap keeps well inside client timeouts; past it we say it is still stopping.
+_SETTLE_TRIES, _SETTLE_POLL = 10, 3.0
+
+
+async def _settled(backend: BackendClient, job_id: str) -> dict[str, Any]:
+    """The video once it has stopped, or {} if it can't be read: the action itself already
+    succeeded, so a failed follow-up read must not turn it into an error."""
+    job: dict[str, Any] = {}
+    try:
+        for attempt in range(_SETTLE_TRIES):
+            if attempt:
+                await asyncio.sleep(_SETTLE_POLL)
+            job = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
+            if job.get("status") != "processing":
+                break
+    except ToolError:
+        pass
+    return job
+
+
+def _control_summary(action: str, answered: Any, job: dict[str, Any]) -> str:
+    cost = job.get("credits_cost")
+    # The settled read wins; if it failed, the action's own answer ("cancelled", "pausing") stands.
+    status = job.get("status") or answered
+    if action == "cancel":
+        if status == "cancelled":
+            return f"Cancelled. {cost} credits returned." if cost else "Cancelled. Your credits were returned."
+        return "Stopping it now. Your credits come back as soon as it stops; ask me in a minute."
+    if action == "pause":
+        if status == "paused":
+            return "Paused. Your credits stay held; say \"resume\" to carry on for free."
+        return "Pausing it now; it stops in a moment. Say \"resume\" later to carry on for free."
+    return "Started again. It takes a few minutes; ask me to check on it any time."
+
+
+def _details_summary(changed: dict[str, dict[str, Any]], live: Any) -> str:
+    if not changed:
+        return "Nothing changed: the video already had those details."
+    parts = []
+    for key, change in changed.items():
+        if key == "title":
+            parts.append(f'title from "{change["from"] or "none"}" to "{change["to"]}"')
+        elif key == "visibility":
+            parts.append(f"who can see it to {change['to']}")
+        else:
+            parts.append(f"the {key}")
+    text = "Changed " + ", ".join(parts) + "."
+    live = live if isinstance(live, dict) else {}
+    if live.get("updated"):
+        text += " Also updated on YouTube."
+    for failure in live.get("failed") or []:
+        if isinstance(failure, dict):
+            text += f" Saved here, but on {failure.get('account_name') or 'YouTube'}: {failure.get('error')}"
+    return text + ' Say "undo" to switch back.'
 
 
 def _ids(options: Any) -> set[str]:
@@ -163,6 +341,18 @@ def _check_choices(config: Any, body: dict[str, Any]) -> None:
         if body.get(key) and valid and body[key] not in valid:
             raise ToolError(
                 f"{key} {body[key]!r} is not offered. Choose one of: {', '.join(sorted(valid)[:20])}. "
+                "Nothing was charged."
+            )
+    # Resolution and sound depend on the format; "auto" picks a format later, so only check a known one.
+    for key, by_format, word in (
+        ("resolution", config.get("resolutions_by_format"), "resolution"),
+        ("audio_mode", audio.get("by_format"), "sound"),
+    ):
+        entry = (by_format or {}).get(body.get("format")) if isinstance(by_format, dict) else None
+        valid = _ids(entry.get("available")) if isinstance(entry, dict) else set()
+        if body.get(key) and valid and body[key] not in valid:
+            raise ToolError(
+                f"This format doesn't offer {word} {body[key]!r}; it offers {', '.join(sorted(valid))}. "
                 "Nothing was charged."
             )
 
@@ -197,7 +387,7 @@ def _working_first(jobs: list[dict[str, Any]], show: str) -> tuple[list[dict[str
 
 def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
-        title="Get video options",
+        title="See video choices",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -211,12 +401,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         formats, styles per format, voices, languages, music, modes, resolutions, and the valid
         lengths for one format. Read-only; spends nothing.
 
-        Do: ask one choice at a time with 2-4 options (label plus a short description) and a
-        recommended default. Call again with format=... after the user picks one: lengths
-        depend on the format.
+        Do: keep it to two questions for most people: the topic, then quality (``choices.quality``,
+        the first one recommended). Offer format, length, sound or style only when the user wants
+        to choose; describe formats with ``choices.formats`` lines ("Action: continuous action,
+        beat by beat"), never their ids. Call again with format=... after the user picks one:
+        lengths depend on the format.
         Don't: paste the whole catalogue, or invent ids (voices, styles, music) that are not here.
-        Returns: ``config`` (formats, styles_by_format, audio.voices, audio.music_tracks, ...)
-        and ``lengths`` for the given format. Pass ids exactly as returned.
+        Returns: ``choices`` (plain lines for formats and quality), ``config`` (formats,
+        styles_by_format, audio.voices, audio.music_tracks, ...) and ``lengths`` for the given
+        format. Pass ids exactly as returned.
         Example: "what kinds of videos can you make?" -> get_video_options(), then offer the 3-4
         formats that fit their topic plus Auto, one short line each.
         Example: user picks the pov format -> get_video_options(format="pov", niche=topic) and
@@ -236,10 +429,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 },
             ),
         )
-        return {"config": _strip_previews(config), "lengths": lengths}
+        config = _strip_previews(config)
+        return {
+            "choices": _plain_choices(config),
+            "config": config,
+            "lengths": lengths,
+        }
 
     @server.tool(
-        title="Preview video price",
+        title="Check video price",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -258,8 +456,9 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         the same settings you will pass to create_video.
         Don't: ask for approval when ``can_afford`` is false; show the price, the balance and
         the billing link from the server instructions instead.
-        Returns: the settings the video will really use, ``estimated_credits``, the user's
-        ``balance`` and ``can_afford``. The ``credits_cost`` create_video returns is the exact charge.
+        Returns: the settings the video will really use, ``estimated_credits``, ``balance``,
+        ``can_afford``, ``adjustments`` (what the engine changed from the request: tell the user),
+        an optional ``warning`` (recent failures) and a ``summary`` to pass on.
         """
         params = _resolve_params(
             mode=mode,
@@ -313,8 +512,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             params=_optional_params(updated_since=updated_since),
         )
         jobs = result if isinstance(result, list) else []
-        if query and query.strip():
-            words = query.lower().split()
+        words = _words(query) if query else []
+        if words:
             jobs = [job for job in jobs if all(
                 word in f"{job.get('title') or ''} {job.get('niche') or ''}".lower() for word in words
             )]
@@ -326,8 +525,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         elif show != "all":
             jobs = [job for job in jobs if job.get("status") in _SHOW[show]]
         end = offset + limit
+        # The change feed needs updated_at to advance; plain browsing does not.
+        videos = [_job_summary(job, full=updated_since is not None) for job in jobs[offset:end]]
         return {
-            "videos": [_job_summary(job) for job in jobs[offset:end]],
+            "summary": _videos_summary(videos, len(jobs), hidden),
+            "videos": videos,
             "total": len(jobs),
             "hidden": hidden,
             "offset": offset,
@@ -336,7 +538,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         }
 
     @server.tool(
-        title="Get a video",
+        title="Check a video",
         annotations=READ_ONLY,
         meta=GALLERY_META,
         structured_output=True,
@@ -351,8 +553,17 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: id, status, progress_pct, active_stage, credits_cost, title, video_url,
         thumbnail_urls; a failed video has an ``error`` sentence to pass on.
         """
+        job_id = await _video_ref(backend, job_id)
         result = await _api(backend, "GET", f"/api/jobs/{job_id}")
-        return {**_job_summary(result), "shown_as_gallery": shown_as_gallery(ctx)}
+        row = _job_summary(_dict_result(result), full=True)
+        summary = _video_line(row) + "."
+        if row["status"] in _DONE and row.get("video_url"):
+            summary += " It's ready to watch or post."
+        elif row["status"] in _DONE:
+            summary += " Ready, but its link isn't available right now."
+        elif row["status"] in _IN_PROGRESS - {"paused"}:
+            summary += " Videos take a few minutes; I'll check again when you ask."
+        return {**row, "summary": summary, "shown_as_gallery": shown_as_gallery(ctx)}
 
     @server.tool(
         title="Make a video",
@@ -363,33 +574,43 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     async def create_video(
         niche: Niche,
         total_length: Annotated[int, Field(ge=1, le=3600, description="Requested duration in seconds.")],
-        idempotency_key: IdempotencyKey,
         format: Annotated[str, Field(max_length=64, description="Format id from get_video_options; auto picks one.")] = "auto",
-        mode: Annotated[str, Field(max_length=32, description="Quality mode from get_video_options.")] = "lite",
+        mode: Annotated[str, Field(max_length=32, description="Quality: a mode id from get_video_options (lite is Standard).")] = "lite",
         resolution: Annotated[str, Field(max_length=32, description="Output resolution.")] = "720p",
         style: Annotated[str | None, Field(max_length=200, description="Optional visual style for this format; omit for auto.")] = None,
         audio_mode: Annotated[str | None, Field(max_length=32, description="Optional sound choice, such as narration.")] = None,
         narrator_voice: Annotated[str | None, Field(max_length=64, description="Optional narrator voice.")] = None,
         narration_language: Annotated[str | None, Field(max_length=64, description="Optional narration language.")] = None,
         music_track: Annotated[str | None, Field(max_length=128, description="Optional music track identifier.")] = None,
+        expected_credits: Annotated[int | None, Field(ge=0, description=(
+            "Required with confirm=true: the estimated_credits from the preview the user approved. "
+            "If the price changed since, nothing is charged and the new price comes back."
+        ))] = None,
+        idempotency_key: Annotated[str | None, Field(min_length=1, max_length=200, description=(
+            "Leave out: retries of the same video are recognized automatically and never charge "
+            "twice. Pass a new made-up key only when the user deliberately wants a second copy "
+            "of a video they already made with exactly the same settings."
+        ))] = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Use when the user has approved making one video. This holds credits.
+        """Use when the user wants to make one video. Call it first without confirm to get a
+        preview, then again with confirm=true after the user says yes. Holds credits.
 
-        Do: gather the choices one at a time (topic, format, length, sound and voice, style),
-        quote with get_video_price, show a one-line summary with ``estimated_credits`` and the
-        balance, and get explicit approval. For several videos, quote the total first and use a
-        NEW idempotency_key for each.
-        Don't: say the video is ready, poll in a loop, or pass voice/style/music ids that
-        get_video_options did not return (they are refused here before any charge).
-        Returns: id, status ("queued"/"pending" = accepted, NOT finished; a video takes a few
-        minutes), ``credits_cost`` (the exact charge) and ``next_step``.
-        Example: "make a 30s video about the Roman empire with a deep male voice" ->
-        get_video_options, get_video_price(niche, total_length=30, audio_mode="narration"),
-        show "30s, narrated, voice Atlas, 18 credits (you have 120)", and on "yes" ->
-        create_video(niche, total_length=30, audio_mode="narration", narrator_voice="atlas",
-        idempotency_key="rome-30s-1", confirm=true).
-        Example: the call timed out -> call again with the SAME idempotency_key; it never charges twice.
+        Do: ask the topic, then offer quality (mode labels; Standard recommended). Ask about
+        format, length, sound, voice or style only if the user wants to choose; otherwise
+        leave the defaults (auto). Show the preview's ``summary``, ``adjustments`` and any
+        ``warning``, get a yes, then call again with confirm=true and
+        expected_credits=<the preview's estimated_credits>. For several videos, preview the
+        total first.
+        Don't: say the video is ready (it takes a few minutes), poll in a loop, or invent
+        voice/style/music ids (they are refused before any charge).
+        Returns: without confirm, a preview (status "needs_approval"). With confirm, the video
+        (status_label "In line" = accepted, NOT finished), ``credits_cost`` (the exact charge),
+        ``replayed`` when this exact video already existed (no new charge), and ``summary``.
+        Example: "make a 30s video about the Roman empire" -> create_video(niche, total_length=30)
+        shows "18 credits. You have 120, enough for about 6 like this."; on "yes" ->
+        create_video(niche, total_length=30, expected_credits=18, confirm=true).
+        Example: the call timed out -> call again with the same settings; it never charges twice.
         """
         body = _create_params(
             niche=niche,
@@ -402,28 +623,63 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             narrator_voice=narrator_voice,
             narration_language=narration_language,
             music_track=music_track,
-            idempotency_key=idempotency_key,
+            idempotency_key=idempotency_key or "pending",
         )
-        if style or narrator_voice or music_track:
-            _check_choices(await _api(backend, "GET", "/api/config"), body)
-        _require_confirmation(confirm, "Video creation")
-        result = await _api(backend, "POST", "/api/jobs", body=body)
-        if not isinstance(result, dict):
-            return {"result": result}
-        if result.get("niche") not in (None, body["niche"]):
-            # The backend returns the earlier video for a reused key, so this is not a new one.
+        if idempotency_key is None:
+            body["idempotency_key"] = _auto_key(body)
+        params = _resolve_params(
+            mode=mode, total_length=total_length, format=format, resolution=resolution,
+            audio_mode=audio_mode, workflow=None, niche=niche,
+        )
+        quote = await _quote(backend, params, body)
+        if not confirm:
+            return {
+                "status": "needs_approval",
+                **quote,
+                "next_step": (
+                    "Show the user the summary (and any adjustments or warning) and ask to go ahead. "
+                    "On yes, call create_video again with the same settings, confirm=true and "
+                    f"expected_credits={quote.get('estimated_credits')}."
+                ),
+            }
+        if expected_credits is None:
+            raise ToolError(
+                "Nothing was made. Call create_video without confirm first, show the user the price, "
+                "then confirm with expected_credits from that preview."
+            )
+        if quote.get("estimated_credits") != expected_credits:
+            raise ToolError(
+                f"The price changed from {expected_credits} to {quote.get('estimated_credits')} credits "
+                "since the user approved it. Nothing was charged. Show the new price and ask again."
+            )
+        result = _dict_result(await _api(backend, "POST", "/api/jobs", body=body))
+        # A new video comes back as {id, status, credits_cost}; an existing one for the same key
+        # comes back whole (with its topic): that is a replay, nothing new was made or charged.
+        replayed = "niche" in result
+        if replayed and result.get("niche") != body["niche"]:
             raise ToolError(
                 f"This idempotency_key was already used for another video ({result.get('niche')!r}, "
                 f"id {result.get('id')}); nothing new was made. Use a new key for a new video."
             )
+        row = _job_summary(result)
+        if replayed:
+            return _with_next(
+                {**row, "replayed": True},
+                "Nothing new was made. If the user wants another copy anyway, call again with a "
+                "new idempotency_key (after a new approval).",
+                f"You already made this exact video ({row.get('created') or 'earlier'}), so nothing "
+                f"new was charged. It's {row['status_label'].lower()}.",
+            )
         return _with_next(
-            _job_summary(result),
-            "Queued, not ready: a video takes a few minutes. Tell the user, and check with "
-            "get_video when they ask; do not poll in a loop.",
+            row,
+            "Queued, not ready: a video takes a few minutes. Check with get_video when the user "
+            "asks; do not poll in a loop.",
+            f"Your video is in line to be made ({row.get('credits_cost', expected_credits)} credits). "
+            "It takes a few minutes; ask me to check on it any time.",
         )
 
     @server.tool(
-        title="Cancel, pause or retry a video",
+        title="Stop, pause or redo a video",
         annotations=WRITE,
         structured_output=True,
     )
@@ -441,22 +697,27 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Do: read it with get_video first; for a retry of a failed or cancelled one, say the
         price (credits_cost) before asking.
         Don't: cancel or pause a ready video (it is refused), or retry in a loop.
-        Returns: the new status plus ``next_step``.
+        Returns: the new status, the video, ``summary`` and ``next_step``. Cancel and pause
+        wait up to ~30s for the video to actually stop, so the summary says whether the credits
+        are already back.
         Example: "retry the failed one" -> get_video shows failed, credits_cost 18 -> "Retrying
         charges 18 credits again. Go ahead?" -> control_video(job_id, "retry", confirm=true).
         """
-        _require_confirmation(confirm, f"Video job {action}")
+        job_id = await _video_ref(backend, job_id)
+        _require_confirmation(confirm, f"Video {action}")
         try:
-            result = await _api(backend, "POST", f"/api/jobs/{job_id}/{action}")
-            return _with_next(result, _CONTROL_NEXT[action])
+            result = _dict_result(await _api(backend, "POST", f"/api/jobs/{job_id}/{action}"))
         except ToolError:
             if action == "retry":
                 raise
             # The backend answers "not found or already finished"; say which, from the video itself.
             job = await _api(backend, "GET", f"/api/jobs/{job_id}")
             raise ToolError(
-                f"This video is {job.get('status')}, so there is nothing to {action}."
+                f"This video is {_label(job.get('status')).lower()}, so there is nothing to {action}."
             ) from None
+        job = await _settled(backend, job_id) if action != "retry" else {}
+        return _with_next({**result, **_job_summary(job)} if job else result, _CONTROL_NEXT[action],
+                          _control_summary(action, result.get("status"), job))
 
     @server.tool(
         title="Edit video title and details",
@@ -477,11 +738,13 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Use when the user wants to change a video's title, description, tags or YouTube
         visibility. Free, but a write: it may also change an already published YouTube video.
 
-        Do: show the exact new values and get approval before confirm=true.
+        Do: show the exact new values and get approval before confirm=true. Afterwards, pass on
+        the summary: it says whether the live YouTube video changed too, and offers undo.
         Don't: send fields the user did not ask to change (tags replace the whole list).
-        Returns: the updated video.
+        Returns: the updated video, ``changed`` (from/to, for undo), ``live_update`` and ``summary``.
         """
-        _require_confirmation(confirm, "Video metadata update")
+        job_id = await _video_ref(backend, job_id)
+        _require_confirmation(confirm, "Video details update")
         body = _optional_params(
             title=_bounded_text(title, "title", 500),
             description=description.strip() if description is not None else None,
@@ -489,8 +752,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             visibility=visibility,
         )
         if not body:
-            raise ToolError("Provide at least one metadata field to update.")
-        result = await _api(backend, "PATCH", f"/api/jobs/{job_id}", body=body)
-        if isinstance(result, dict) and isinstance(result.get("job"), dict):
-            return {**result, "job": _job_summary(result["job"])}
-        return _dict_result(result)
+            raise ToolError("Provide at least one detail to change.")
+        before = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
+        result = _dict_result(await _api(backend, "PATCH", f"/api/jobs/{job_id}", body=body))
+        changed = {k: {"from": before.get(k), "to": v} for k, v in body.items() if before.get(k) != v}
+        if isinstance(result.get("job"), dict):
+            result["job"] = _job_summary(result["job"])
+        return _with_next(
+            {**result, "changed": changed},
+            "To undo, call update_video_details with each changed field's 'from' value, after the user asks.",
+            _details_summary(changed, result.get("live_update")),
+        )

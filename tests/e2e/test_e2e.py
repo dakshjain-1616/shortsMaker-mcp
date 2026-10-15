@@ -154,6 +154,16 @@ def call(stack, tool, args=None, **kw):
     return run(stack, lambda c: c.call_tool(tool, args or {}), **kw)
 
 
+def make_video(stack, args, **kw):
+    """Make a video the way an agent must: preview, then confirm with the previewed price."""
+    args = {k: v for k, v in args.items() if k != "confirm"}
+    preview = call(stack, "create_video", args, **kw)
+    if preview.is_error:
+        return preview
+    price = preview.structured_content["estimated_credits"]
+    return call(stack, "create_video", {**args, "expected_credits": price, "confirm": True}, **kw)
+
+
 def text(result) -> str:
     return " ".join(getattr(block, "text", "") for block in result.content)
 
@@ -183,7 +193,7 @@ def test_modern_protocol_discovers_and_calls_a_read_tool(stack, path):
         assert client.session.discover_result is not None
         assert len((await client.list_tools()).tools) == 29
         result = await client.call_tool("get_credits", {})
-        assert result.structured_content == {"balance": 100}
+        assert result.structured_content == {"balance": 100, "summary": "You have 100 credits."}
 
     run(stack, verify, path=path)
 
@@ -203,7 +213,7 @@ def test_initialize_and_tools_work_across_separate_instances(stack):
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
         "params": {"name": "get_credits", "arguments": {}}})
     assert called.status_code == 200
-    assert called.json()["result"]["structuredContent"] == {"balance": 100}
+    assert called.json()["result"]["structuredContent"] == {"balance": 100, "summary": "You have 100 credits."}
     assert httpx.get(f"{stack['replica']}/dashboard").status_code == 404
 
 
@@ -217,7 +227,7 @@ def test_stateless_requests_use_each_tokens_identity_and_scopes(stack):
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "get_credits", "arguments": {}}})
         assert response.status_code == 200
-        assert response.json()["result"]["structuredContent"] == {"balance": expected_balance}
+        assert response.json()["result"]["structuredContent"] ["balance"] == expected_balance
     assert [entry["user"] for entry in backend_calls(stack)] == ["user-a", "user-b", "user-b"]
     # A previous write grant cannot survive into the next request's read-only grant.
     response = httpx.post(f"{stack['mcp']}/mcp/", headers={
@@ -236,7 +246,7 @@ def test_prompts_render_and_reject_bad_arguments(stack):
     bare = run(stack, lambda c: c.get_prompt("new_series", {}))
     assert "what the series should be about" in bare.messages[0].content.text
     with pytest.RaisesGroup(MCPError, flatten_subgroups=True):
-        run(stack, lambda c: c.get_prompt("share_video", {"job_id": "not-a-uuid"}))
+        run(stack, lambda c: c.get_prompt("share_video", {"job_id": "x" * 201}))
 
 
 # ---------------------------------------------------------------- branding and gallery
@@ -282,9 +292,9 @@ def test_gallery_flag_follows_client_support(stack):
 
 
 def test_read_tools_return_backend_data(stack):
-    assert call(stack, "get_credits").structured_content == {"balance": 100}
+    assert call(stack, "get_credits").structured_content == {"balance": 100, "summary": "You have 100 credits."}
     assert call(stack, "list_videos").structured_content == {
-        "videos": [], "total": 0, "hidden": {}, "offset": 0, "next_offset": None, "shown_as_gallery": False
+        "summary": "No videos here yet.", "videos": [], "total": 0, "hidden": {}, "offset": 0, "next_offset": None, "shown_as_gallery": False
     }
     options = call(stack, "get_video_options", {"mode": "pro", "resolution": "1080p"})
     assert not options.is_error
@@ -295,7 +305,7 @@ def test_read_tools_return_backend_data(stack):
 def test_price_quote_includes_credits_matching_the_charge(stack):
     quote = call(stack, "get_video_price", {"total_length": 12}).structured_content
     assert "estimated_cost" not in quote and quote["estimated_credits"] == 10
-    job = call(stack, "create_video", {"niche": "x", "total_length": 12, "idempotency_key": "q", "confirm": True}).structured_content
+    job = make_video(stack, {"niche": "x", "total_length": 12, "idempotency_key": "q", "confirm": True}).structured_content
     assert job["credits_cost"] == quote["estimated_credits"]
 
 
@@ -331,25 +341,44 @@ def test_every_read_only_tool_runs_without_side_effects(stack):
 
 
 def test_create_video_end_to_end_and_summary_strips_large_fields(stack):
-    created = call(
-        stack,
-        "create_video",
-        {"niche": "  deep sea  ", "total_length": 15, "idempotency_key": "k1", "confirm": True},
-    ).structured_content
-    assert created["status"] == "pending" and created["niche"] == "deep sea"
+    preview = call(stack, "create_video", {"niche": "  deep sea  ", "total_length": 90}).structured_content
+    assert preview["status"] == "needs_approval" and preview["estimated_credits"] == 10
+    assert preview["adjustments"] == ["Length changed from 90s to 60s, the closest this format allows."]
+    assert preview["summary"].startswith("This video costs 10 credits. You have 100, enough for about 10")
+    assert all(c["method"] == "GET" for c in backend_calls(stack))  # a preview never writes
+
+    created = call(stack, "create_video", {
+        "niche": "  deep sea  ", "total_length": 90, "expected_credits": 10, "confirm": True,
+    }).structured_content
+    assert created["status_label"] == "In line" and "replayed" not in created
     assert "config" not in created and "owner" not in created
-    assert call(stack, "get_credits").structured_content == {"balance": 90}
-    fetched = call(stack, "get_video", {"job_id": created["id"]}).structured_content
-    assert fetched["id"] == created["id"]
+    assert call(stack, "get_credits").structured_content == {"balance": 90, "summary": "You have 90 credits."}
+    fetched = call(stack, "get_video", {"job_id": "deep sea"}).structured_content  # found by name
+    assert fetched["id"] == created["id"] and fetched["title"] == "deep sea"
+
+
+def test_retried_create_without_a_key_is_a_replay_not_a_second_charge(stack):
+    args = {"niche": "marble race", "total_length": 15}
+    first = make_video(stack, args).structured_content
+    again = make_video(stack, args).structured_content
+    assert again["id"] == first["id"] and again["replayed"] is True
+    assert "nothing new was charged" in again["summary"]
+    assert call(stack, "get_credits").structured_content["balance"] == 90
+
+
+def test_price_lock_refuses_a_stale_approval_before_any_write(stack):
+    result = call(stack, "create_video", {"niche": "x", "total_length": 15, "expected_credits": 7, "confirm": True})
+    assert result.is_error and "changed from 7 to 10" in text(result) and "Nothing was charged" in text(result)
+    assert all(c["method"] == "GET" for c in backend_calls(stack))
 
 
 def test_list_videos_pages_newest_first_with_next_offset(stack):
     for i in range(7):
-        call(stack, "create_video", {"niche": f"video-{i}", "total_length": 15, "idempotency_key": f"page-{i}", "confirm": True})
+        make_video(stack, {"niche": f"video-{i}", "total_length": 15, "idempotency_key": f"page-{i}", "confirm": True})
 
     def page(**args):
         data = call(stack, "list_videos", args).structured_content
-        return [v["niche"] for v in data["videos"]], data
+        return [v["title"] for v in data["videos"]], data
 
     niches, data = page(limit=5)
     assert niches == [f"video-{i}" for i in (6, 5, 4, 3, 2)]
@@ -367,14 +396,14 @@ def test_list_videos_pages_newest_first_with_next_offset(stack):
 
 def test_list_videos_hides_failed_videos_unless_asked(stack):
     for niche in ("failed-early", "kept", "failed-late"):
-        call(stack, "create_video", {"niche": niche, "total_length": 15, "idempotency_key": niche, "confirm": True})
+        make_video(stack, {"niche": niche, "total_length": 15, "idempotency_key": niche, "confirm": True})
 
     data = call(stack, "list_videos", {}).structured_content
-    assert [v["niche"] for v in data["videos"]] == ["kept"]
+    assert [v["title"] for v in data["videos"]] == ["kept"]
     assert data["hidden"] == {"failed": 2} and data["total"] == 1
 
     failed = call(stack, "list_videos", {"show": "failed"}).structured_content
-    assert [v["niche"] for v in failed["videos"]] == ["failed-late", "failed-early"]
+    assert [v["title"] for v in failed["videos"]] == ["failed-late", "failed-early"]
     assert failed["hidden"] == {}
 
 
@@ -385,10 +414,10 @@ def test_list_videos_rejects_bad_paging(stack, args):
 
 def test_idempotency_key_replay_does_not_double_charge(stack):
     args = {"niche": "x", "total_length": 15, "idempotency_key": "same", "confirm": True}
-    first = call(stack, "create_video", args).structured_content
-    second = call(stack, "create_video", args).structured_content
+    first = make_video(stack, args).structured_content
+    second = make_video(stack, args).structured_content
     assert first["id"] == second["id"]
-    assert call(stack, "get_credits").structured_content == {"balance": 90}
+    assert call(stack, "get_credits").structured_content == {"balance": 90, "summary": "You have 90 credits."}
 
 
 def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
@@ -404,7 +433,7 @@ def test_users_are_isolated_and_concurrent_calls_keep_their_own_token(stack):
     assert all(r == [100] * 5 for r in results[0::2])
     assert all(r == [5] * 5 for r in results[1::2])
 
-    mine = call(stack, "create_video", {"niche": "mine", "total_length": 15, "idempotency_key": "iso", "confirm": True})
+    mine = make_video(stack, {"niche": "mine", "total_length": 15, "idempotency_key": "iso", "confirm": True})
     job_id = mine.structured_content["id"]
     stolen = call(stack, "get_video", {"job_id": job_id}, token="other-token")
     assert stolen.is_error and "not found" in text(stolen).lower()
@@ -417,6 +446,7 @@ WRITE_ARGS = {
     "create_series": {
         "name": "n", "theme": "theme", "connection_ids": [UUID0], "timezone": "UTC",
         "days_of_week": [0], "times_of_day": ["09:00"], "job_defaults": {"total_length": 15},
+        "visibility": "public",
     },
     "update_series": {"series_id": UUID0, "name": "x"},
     "pause_series": {"series_id": UUID0},
@@ -430,9 +460,12 @@ WRITE_ARGS = {
     "update_video_details": {"job_id": UUID0, "title": "t"},
     "connect_account": {"platform": "youtube"},
     "disconnect_account": {"connection_id": UUID0},
-    "publish_video": {"job_id": UUID0, "connection_ids": [UUID0]},
+    "publish_video": {"job_id": UUID0, "connection_ids": [UUID0], "visibility": "public"},
     "control_post": {"post_id": UUID0, "action": "cancel"},
 }
+
+
+PREVIEW_TOOLS = {"create_video", "create_series", "publish_video", "update_series"}
 
 
 def test_every_write_tool_refuses_without_confirmation_and_never_reaches_backend(stack):
@@ -443,9 +476,14 @@ def test_every_write_tool_refuses_without_confirmation_and_never_reaches_backend
     for name in sorted(writes):
         for extra in ({}, {"confirm": False}):
             result = call(stack, name, {**WRITE_ARGS[name], **extra})
-            assert result.is_error, name
-            assert "confirm" in text(result).lower(), (name, text(result))
-    assert backend_calls(stack) == []
+            if name in PREVIEW_TOOLS:
+                # These answer an unconfirmed call with a preview to show the user (or refuse a
+                # missing video); either way only reads reach the backend, checked below.
+                assert result.is_error or result.structured_content["status"] == "needs_approval", name
+            else:
+                assert result.is_error, name
+                assert "confirm" in text(result).lower(), (name, text(result))
+    assert [c for c in backend_calls(stack) if c["method"] != "GET"] == []
 
 
 def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
@@ -460,11 +498,16 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
         "update_video_details": ("PATCH", f"/api/jobs/{UUID0}"),
         "publish_video": ("POST", "/api/posts"),
     }
+    # Editing and cancelling read the video around the write, so they need one that exists.
+    job_id = make_video(stack, {"niche": "real", "total_length": 15}).structured_content["id"]
+    real = {"control_video": {"job_id": job_id}, "update_video_details": {"job_id": job_id}}
+    for name in real:
+        expected[name] = (expected[name][0], expected[name][1].replace(UUID0, job_id))
     for name, (method, path) in expected.items():
-        httpx.delete(f"{stack['backend']}/__calls")
-        result = call(stack, name, {**WRITE_ARGS[name], "confirm": True})
+        start = len(backend_calls(stack))  # not cleared: clearing would also delete the video
+        result = call(stack, name, {**WRITE_ARGS[name], **real.get(name, {}), "confirm": True})
         assert not result.is_error, (name, text(result))
-        writes = [(c["method"], c["path"]) for c in backend_calls(stack) if c["method"] != "GET"]
+        writes = [(c["method"], c["path"]) for c in backend_calls(stack)[start:] if c["method"] != "GET"]
         assert writes == [(method, path)], name  # pre-flight reads are fine; exactly one write
 
 
@@ -479,13 +522,12 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
         ("get_video_price", {"total_length": 3601}, ""),
         ("get_video_price", {"total_length": "abc"}, ""),
         ("get_video_price", {"total_length": 15, "mode": "x" * 33}, ""),
-        ("get_video", {"job_id": "not-a-uuid"}, ""),
+        ("get_video", {"job_id": "x" * 201}, ""),
         ("create_video", {"niche": "   ", "total_length": 15, "idempotency_key": "k", "confirm": True}, "required"),
         ("create_video", {"niche": "x" * 10_001, "total_length": 15, "idempotency_key": "k", "confirm": True}, ""),
         ("create_video", {"niche": "x", "total_length": 15, "idempotency_key": " ", "confirm": True}, "required"),
-        ("create_video", {"niche": "x", "total_length": 15, "confirm": True}, ""),
         ("publish_video", {"job_id": UUID0, "connection_ids": [], "confirm": True}, ""),
-        ("publish_video", {"job_id": UUID0, "connection_ids": [UUID0], "scheduled_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
+        ("publish_video", {"job_id": UUID0, "connection_ids": [UUID0], "visibility": "public", "scheduled_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
         ("create_series", {**WRITE_ARGS["create_series"], "ends_at": "2030-01-01T12:00:00", "confirm": True}, "timezone"),
         ("create_series", {**WRITE_ARGS["create_series"], "lead_minutes": 29, "confirm": True}, ""),
         ("create_series", {**WRITE_ARGS["create_series"], "grace_minutes": 10081, "confirm": True}, ""),
@@ -495,7 +537,6 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
         ("create_series", {**WRITE_ARGS["create_series"], "times_of_day": ["25:00"], "confirm": True}, "HH:MM"),
         ("create_series", {**WRITE_ARGS["create_series"], "days_of_week": [7], "confirm": True}, ""),
         ("create_series", {**WRITE_ARGS["create_series"], "timezone": "PST", "confirm": True}, "IANA"),
-        ("create_series", {**WRITE_ARGS["create_series"], "job_defaults": {"format": "pov"}, "confirm": True}, "total_length"),
         ("create_series", {**WRITE_ARGS["create_series"], "ends_at": "2020-01-01T00:00:00Z", "confirm": True}, "past"),
         ("update_series", {"series_id": UUID0, "confirm": True}, "at least one"),
         ("update_video_details", {"job_id": UUID0, "confirm": True}, "at least one"),
@@ -514,9 +555,9 @@ def test_invalid_arguments_are_rejected_before_the_backend(stack, tool, args, fr
 
 def test_unicode_and_boundary_values_are_accepted(stack):
     args = {"niche": "日本語 🌊 " + "x" * 9980, "total_length": 3600, "idempotency_key": "é" * 200, "confirm": True}
-    result = call(stack, "create_video", args)
+    result = make_video(stack, args)
     assert not result.is_error, text(result)
-    sent = backend_calls(stack)[0]["body"]
+    sent = next(c for c in backend_calls(stack) if c["method"] == "POST")["body"]
     assert sent["total_length"] == 3600 and sent["niche"].startswith("日本語 🌊")
 
 
@@ -527,7 +568,7 @@ def test_read_filters_still_accept_naive_updated_since(stack):
 
 
 def test_duplicate_connection_ids_are_deduplicated(stack):
-    call(stack, "publish_video", {"job_id": UUID0, "connection_ids": [UUID0, UUID0], "confirm": True})
+    call(stack, "publish_video", {"job_id": UUID0, "connection_ids": [UUID0, UUID0], "visibility": "public", "confirm": True})
     post = next(c for c in backend_calls(stack) if c["method"] == "POST")
     assert post["body"]["connection_ids"] == [UUID0]
 
@@ -536,19 +577,19 @@ def test_duplicate_connection_ids_are_deduplicated(stack):
 
 
 def test_insufficient_credits_message_is_passed_through(stack):
-    result = call(stack, "create_video", {"niche": "x", "total_length": 15, "idempotency_key": "p", "confirm": True}, token="other-token")
+    result = make_video(stack, {"niche": "x", "total_length": 15, "idempotency_key": "p", "confirm": True}, token="other-token")
     # other-token has 5 credits, job costs 10
     assert result.is_error and "need 10, have 5." in text(result) and "get_credits" in text(result)
 
 
 def test_backend_500_detail_is_sanitised(stack):
-    result = call(stack, "create_video", {"niche": "boom500", "total_length": 15, "idempotency_key": "b", "confirm": True})
+    result = make_video(stack, {"niche": "boom500", "total_length": 15, "idempotency_key": "b", "confirm": True})
     assert result.is_error
     assert "psycopg2" not in text(result) and "10.0.0.5" not in text(result)
 
 
 def test_backend_non_json_response_is_a_clean_error(stack):
-    result = call(stack, "create_video", {"niche": "badjson", "total_length": 15, "idempotency_key": "j", "confirm": True})
+    result = make_video(stack, {"niche": "badjson", "total_length": 15, "idempotency_key": "j", "confirm": True})
     assert result.is_error and "<html>" not in text(result)
 
 
