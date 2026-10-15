@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
@@ -24,9 +25,11 @@ from ._common import (
     _bounded_text,
     _clean_tags,
     _dict_result,
+    _fail,
     _items,
     _label,
     _optional_params,
+    _post_state,
     _require_confirmation,
     _video_ref,
     _when,
@@ -34,35 +37,69 @@ from ._common import (
 )
 
 
+async def _health(backend: BackendClient) -> dict[str, Any]:
+    """Whether posting works right now; {} (unknown, assume fine) if it can't be read, since
+    a diagnostic must never block listing accounts or posting."""
+    try:
+        return _dict_result(await _api(backend, "GET", "/api/publishing/health"))
+    except ToolError:
+        return {}
+
+
+_DELAYED = "Posting is paused on our side; posts wait and go out when it's back"
+
+
+def _posting(c: dict[str, Any], health: dict[str, Any]) -> tuple[str, str]:
+    """Can this account be posted to right now, apart from being connected? (reason, words);
+    reason is ok, reconnect, unsupported or delayed."""
+    if c.get("status") not in (None, "active"):
+        return "reconnect", "Reconnect first"
+    platforms = health.get("worker_platforms")
+    if isinstance(platforms, list) and health.get("worker_alive") and c.get("platform") not in platforms:
+        return "unsupported", f"Posting to {_PLATFORM.get(c.get('platform'), c.get('platform'))} isn't supported yet"
+    if health.get("worker_alive") is False:
+        return "delayed", _DELAYED
+    return "ok", "Working"
+
+
 async def _check_destinations(
     backend: BackendClient, job_id: str, chosen: set[str], allow_repost: bool,
-) -> dict[str, str]:
-    """Catch the mistakes a chat makes that the API accepts: an account that needs reconnecting
-    and a repeat post. Returns the chosen accounts' display names."""
-    connections = await _api(backend, "GET", "/api/connections")
+) -> tuple[dict[str, str], str]:
+    """Catch the mistakes a chat makes that the API accepts: an account that needs reconnecting,
+    a platform posting doesn't support, and a repeat post. Returns the chosen accounts' display
+    names and a warning ("" if none) when posting is delayed."""
+    connections, health = await asyncio.gather(_api(backend, "GET", "/api/connections"), _health(backend))
     rows = {c["id"]: c for c in connections if isinstance(c, dict) and c.get("id") in chosen} \
         if isinstance(connections, list) else {}
     broken = [_account(c) for c in rows.values() if c.get("status") not in (None, "active")]
     if broken:
-        raise ToolError(
+        raise _fail(
+            "needs_reconnect",
             f"{', '.join(broken)} needs reconnecting before posting. Nothing was posted. "
             "Offer connect_account for that platform."
         )
+    posting = {cid: _posting(c, health) for cid, c in rows.items()}
+    unsupported = [why for reason, why in posting.values() if reason == "unsupported"]
+    if unsupported:
+        # A post there would wait forever, so refuse instead of queueing it.
+        raise _fail("platform_unavailable", f"{'; '.join(unsupported)}. Nothing was posted.")
+    delayed = next((why for reason, why in posting.values() if reason == "delayed"), "")
     names = {cid: _account(c) for cid, c in rows.items()}
     if allow_repost:
-        return names
+        return names, delayed
     posts = await _api(backend, "GET", "/api/posts", params={"job_id": str(job_id), "summary": "true"})
     repeats = [
-        f"{names.get(p['connection_id'], 'an account')}: {_label(p['status']).lower()}"
+        f"{names.get(p['connection_id'], 'an account')}: {_post_state(p)['status_label'].lower()}"
         for p in posts if isinstance(p, dict)
         and p.get("connection_id") in chosen and p.get("status") in {"scheduled", "publishing", "published"}
     ] if isinstance(posts, list) else []
     if repeats:
-        raise ToolError(
+        raise _fail(
+            "already_posted",
             "This video is already posted or waiting to post there (" + "; ".join(repeats) + "). Tell the user; "
             "call again with allow_repost=true only if they want it posted again."
         )
-    return names
+    return names, delayed
 
 
 def _post_time(when: datetime | None) -> str:
@@ -81,11 +118,14 @@ def _account(c: dict[str, Any]) -> str:
     return f"{c.get('account_name') or 'your account'} ({platform})"
 
 
-def _connection_row(c: Any) -> Any:
+def _connection_row(c: Any, health: dict[str, Any]) -> Any:
+    """``status_label`` says whether it is signed in; ``can_post``/``posting`` whether posting
+    there actually works right now. Connected is not the same as postable."""
     if not isinstance(c, dict):
         return c
     label = "Connected" if c.get("status") in (None, "active") else _label(c.get("status"))
-    return {**c, "status_label": label}
+    reason, posting = _posting(c, health)
+    return {**c, "status_label": label, "can_post": reason == "ok", "posting": posting}
 
 
 def _connections_summary(connections: list[Any]) -> str:
@@ -95,24 +135,15 @@ def _connections_summary(connections: list[Any]) -> str:
     ok = [_account(c) for c in rows if c.get("status") in (None, "active")]
     broken = [_account(c) for c in rows if c.get("status") not in (None, "active")]
     text = f"Connected: {', '.join(ok)}." if ok else ""
+    for why in sorted({c["posting"] for c in rows if c.get("status") in (None, "active") and not c["can_post"]}):
+        text += f" {why}."
     if broken:
         text += f" {', '.join(broken)} needs reconnecting. Want a sign-in link?"
     return text.strip()
 
 
 def _post_row(p: Any) -> Any:
-    if not isinstance(p, dict):
-        return p
-    status = p.get("status")
-    label = _label(status)
-    if status == "published" and not p.get("platform_post_url"):
-        label = "Sent, not verified"
-    when = ""
-    if status == "scheduled" and p.get("scheduled_at"):
-        when = "goes out " + _when(p["scheduled_at"])
-    elif status == "published" and p.get("published_at"):
-        when = "posted " + _when(p["published_at"])
-    return {**p, "status_label": label, **({"when": when} if when else {})}
+    return {**p, **_post_state(p)} if isinstance(p, dict) else p
 
 
 def _posts_summary(posts: list[Any]) -> str:
@@ -145,12 +176,15 @@ def _connections_next(connections: list[Any]) -> str | None:
 def _posts_next(posts: list[Any]) -> str | None:
     if not posts:
         return "No posts match. Videos are posted with publish_video."
-    if any(isinstance(p, dict) and p.get("status") == "failed" for p in posts):
-        return (
-            "Some posts failed: quote each one's last_error. If it is an account or auth problem, "
-            "reconnect with connect_account before control_post(action='retry')."
-        )
+    if any(isinstance(p, dict) and p.get("state") == "failed" for p in posts):
+        return "Some posts failed: quote each one's last_error and offer its fix."
+    if any(isinstance(p, dict) and p.get("state") == "sent" for p in posts):
+        return "A 'sent' post was accepted by the platform but not confirmed live: never call it live."
     return None
+
+
+# list_posts filters by the user's states; the backend knows only its five statuses.
+_BACKEND_STATUS = {"queued": "scheduled", "sent": "published", "cancelled": "canceled"}
 
 
 def register(server: MCPServer, backend: BackendClient) -> None:
@@ -163,13 +197,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Use when you need the user's YouTube, TikTok or Instagram accounts: before posting,
         creating a series, or when they ask what is connected.
 
-        Do: show each account as "name (platform)"; follow ``next_step`` when present.
+        Do: show each account as "name (platform)"; follow ``next_step`` when present. Being
+        connected is not the same as being able to post: say ``posting`` when ``can_post`` is false.
         Don't: post to an account whose status is not active; reconnect it with connect_account.
-        Returns: ``items`` (id, platform, account_name, status, last_error), ``count`` and,
-        when there is nothing usable, a ``next_step``. Never includes provider tokens.
+        Returns: ``items`` (id, platform, account_name, status, status_label, last_error,
+        can_post, posting), ``count`` and, when there is nothing usable, a ``next_step``. Never
+        includes provider tokens.
         """
-        out = _items(await _api(backend, "GET", "/api/connections"))
-        rows = [_connection_row(c) for c in out["items"]]
+        connections, health = await asyncio.gather(_api(backend, "GET", "/api/connections"), _health(backend))
+        rows = [_connection_row(c, health) for c in _items(connections)["items"]]
         return _items(rows, _connections_next(rows), _connections_summary(rows))
 
     @server.tool(
@@ -179,26 +215,34 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     )
     async def list_posts(
         status: Annotated[
-            Literal["scheduled", "publishing", "published", "failed", "canceled"] | None,
-            Field(description="Optional publishing status filter."),
+            Literal["queued", "scheduled", "publishing", "sent", "published", "failed", "cancelled"] | None,
+            Field(description="Optional filter by state (see Returns)."),
         ] = None,
         job_id: Annotated[str | None, Field(max_length=200, description="Only posts of this video: words from its title, or its id.")] = None,
         updated_since: Annotated[datetime | None, Field(description="Optional timezone-aware update cutoff.")] = None,
     ) -> dict[str, Any]:
         """Use when the user asks whether a video was posted, what is scheduled, or why a post failed.
 
-        Do: report each post's status as-is: only "published" means it is live; "scheduled"
-        and "publishing" are still waiting. Quote ``last_error`` for failed posts.
-        Don't: say a post is live from publish_video's result; check here when the user asks,
-        without polling in a loop.
-        Returns: ``items`` (id, job_id, connection_id, platform, status, scheduled_at,
-        last_error), ``count`` and a ``next_step`` when there are none or some failed.
+        Each post has a ``state``: queued (due, waiting to go out, or trying again after a
+        failed attempt: see ``next_try`` and ``tries``), scheduled (goes out later), publishing
+        (uploading now), sent (the platform accepted it but gave no link back: NOT confirmed
+        live), published (live, with platform_post_url), failed (see ``last_error`` and
+        ``fix``: "Retry the post" = control_post retry, "Reconnect the account" =
+        connect_account first), cancelled.
+        Do: say ``status_label``; only "published" is live. Quote last_error and offer ``fix``
+        for failed posts.
+        Don't: call a sent post live, say a post is live from publish_video's result, or poll
+        in a loop.
+        Returns: ``items`` (id, job_id, platform, account_name, state, status_label, when,
+        last_error, fix), ``count`` and a ``next_step`` when there are none or some need care.
         """
         job_id = await _video_ref(backend, job_id) if job_id else None
-        params = _optional_params(status=status, job_id=job_id, updated_since=updated_since)
+        params = _optional_params(status=_BACKEND_STATUS.get(status, status), job_id=job_id, updated_since=updated_since)
         params["summary"] = "true"
         out = _items(await _api(backend, "GET", "/api/posts", params=params))
         rows = [_post_row(p) for p in out["items"]]
+        if status:
+            rows = [p for p in rows if isinstance(p, dict) and p["state"] == status]
         return _items(rows, _posts_next(rows), _posts_summary(rows))
 
     @server.tool(
@@ -211,9 +255,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
 
         Do: tell the user in plain words whether posting is working.
         Don't: call it before every post; it is a diagnostic, not a precondition.
-        Returns: whether the publishing worker is alive and processing the queue.
+        Returns: whether the publishing worker is alive and processing the queue, which
+        platforms it posts to, and a ``summary``.
         """
-        return _dict_result(await _api(backend, "GET", "/api/publishing/health"))
+        health = _dict_result(await _api(backend, "GET", "/api/publishing/health"))
+        if health.get("worker_alive") is False:
+            summary = "Posting is paused on our side right now. Waiting posts go out as soon as it's back."
+        else:
+            summary = "Posting is working."
+        waiting = health.get("waiting")
+        if isinstance(waiting, int) and waiting:
+            summary += f" {waiting} post{'' if waiting == 1 else 's'} waiting."
+        return {**health, "summary": summary}
 
     @server.tool(
         title="Connect a social account",
@@ -311,15 +364,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         before calling again.
         Don't: guess the timezone, or set allow_repost unless the user asked to post it again.
         Returns: without confirm, a preview (status "needs_approval"; it also refuses an
-        unfinished video or an account that needs reconnecting). With confirm, ``items`` (one
-        post per account, "Waiting to post" = queued, NOT posted yet) and ``summary``.
+        unfinished video, an account that needs reconnecting or a platform posting doesn't
+        support). With confirm, ``items`` (one post per account, state queued or scheduled:
+        NOT posted yet) and ``summary``.
         Example: "post the cooking video to my YouTube tomorrow 9am" -> ask their timezone and
         visibility, publish_video("cooking", ["my YouTube"], "public",
         scheduled_at="2026-10-16T09:00:00-05:00") for the preview, then the same with confirm=true.
         """
         job_id = await _video_ref(backend, job_id)
         if scheduled_at is not None and scheduled_at < datetime.now(UTC) - timedelta(minutes=1):
-            raise ToolError("That time is in the past. Ask for a future time, or post right away.")
+            raise _fail("invalid_input", "That time is in the past. Ask for a future time, or post right away.")
         body = _optional_params(
             job_id=job_id,
             connection_ids=await _account_refs(backend, connection_ids),
@@ -332,24 +386,27 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         if not confirm:
             job = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
             if job.get("status") in ("failed", "cancelled"):
-                raise ToolError("This video didn't finish, so there is nothing to post. Nothing was posted.")
+                raise _fail("wrong_state", "This video didn't finish, so there is nothing to post. Nothing was posted.")
             if job.get("status") not in ("ready", "complete"):
-                raise ToolError(
+                raise _fail(
+                    "wrong_state",
                     f"This video isn't ready to post yet ({_label(job.get('status')).lower()}). "
                     "Nothing was posted; offer to post it once get_video shows it ready."
                 )
-            names = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
+            names, delayed = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
             places = ", ".join(names.values()) or "the chosen accounts"
             name = body.get("title") or job.get("title") or (job.get("niche") or "this video")[:60]
             summary = f"Post \"{name}\" to {places} {_post_time(scheduled_at)}, {visibility}."
             if any(place.endswith("(Instagram)") for place in names.values()) and visibility != "public":
                 summary += " Instagram posts are always public."
+            if delayed:
+                summary += f" Note: {delayed}."
             return {
                 "status": "needs_approval",
                 "summary": summary,
                 "next_step": "Show the summary and ask to post. On yes, call publish_video again with the same values and confirm=true.",
             }
-        names = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
+        names, _ = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
         result = await _api(backend, "POST", "/api/posts", body=body)
         rows = [_post_row(p) for p in (result if isinstance(result, list) else [_dict_result(result)])]
         return _items(

@@ -23,13 +23,17 @@ from ._common import (
     Confirm,
     JobId,
     Niche,
+    PreviewToken,
     _api,
     _bounded_text,
+    _check_token,
     _clean_tags,
     _dict_result,
+    _fail,
     _label,
     _optional_params,
     _parse_time,
+    _preview_token,
     _require_confirmation,
     _video_ref,
     _when,
@@ -102,6 +106,32 @@ def _auto_key(body: dict[str, Any]) -> str:
     same video later replays it too; the result says so and a new key makes a deliberate copy."""
     settings = {key: value for key, value in body.items() if key != "idempotency_key"}
     return "auto-" + hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:40]
+
+
+# What the engine resolves and the job really runs with; confirm sends these exactly, so a
+# re-resolve on the backend (Auto is a model's choice) can't pick something other than the preview.
+_PINNED = ("format", "workflow", "total_length", "audio_mode", "resolution")
+
+
+def _effective(body: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """The settings that will really run: the request overlaid with what the engine resolved."""
+    settings = {key: value for key, value in body.items() if key != "idempotency_key"}
+    for key in _PINNED:
+        value = quote.get(key)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if value not in (None, ""):
+            settings[key] = value
+    return settings
+
+
+def _pinned(body: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """The create body carrying the approved settings; the key stays the request's own."""
+    pinned = {**settings, "idempotency_key": body["idempotency_key"]}
+    if not isinstance(pinned.get("total_length"), int):
+        # The API takes whole seconds; a fractional resolved length is re-resolved from the ask.
+        pinned["total_length"] = body["total_length"]
+    return pinned
 
 
 def _job_summary(job: dict[str, Any], *, full: bool = False) -> dict[str, Any]:
@@ -255,8 +285,7 @@ def _strip_previews(value: Any) -> Any:
 
 _CONTROL_NEXT = {
     "cancel": "Cancel requested; the held credits are refunded once it stops. Confirm with get_video when the user asks.",
-    "pause": "Pause requested; the credits stay held. control_video(action='retry') resumes it for free.",
-    "retry": "Requeued, not ready. Check with get_video when the user asks; do not poll in a loop.",
+    "pause": "Pause requested; the credits stay held. retry_video resumes it for free.",
 }
 
 
@@ -290,11 +319,9 @@ def _control_summary(action: str, answered: Any, job: dict[str, Any]) -> str:
         if status == "cancelled":
             return f"Cancelled. {cost} credits returned." if cost else "Cancelled. Your credits were returned."
         return "Stopping it now. Your credits come back as soon as it stops; ask me in a minute."
-    if action == "pause":
-        if status == "paused":
-            return "Paused. Your credits stay held; say \"resume\" to carry on for free."
-        return "Pausing it now; it stops in a moment. Say \"resume\" later to carry on for free."
-    return "Started again. It takes a few minutes; ask me to check on it any time."
+    if status == "paused":
+        return "Paused. Your credits stay held; say \"resume\" to carry on for free."
+    return "Pausing it now; it stops in a moment. Say \"resume\" later to carry on for free."
 
 
 def _details_summary(changed: dict[str, dict[str, Any]], live: Any) -> str:
@@ -339,7 +366,8 @@ def _check_choices(config: Any, body: dict[str, Any]) -> None:
     ):
         valid = _ids(options)
         if body.get(key) and valid and body[key] not in valid:
-            raise ToolError(
+            raise _fail(
+                "invalid_input",
                 f"{key} {body[key]!r} is not offered. Choose one of: {', '.join(sorted(valid)[:20])}. "
                 "Nothing was charged."
             )
@@ -351,7 +379,8 @@ def _check_choices(config: Any, body: dict[str, Any]) -> None:
         entry = (by_format or {}).get(body.get("format")) if isinstance(by_format, dict) else None
         valid = _ids(entry.get("available")) if isinstance(entry, dict) else set()
         if body.get(key) and valid and body[key] not in valid:
-            raise ToolError(
+            raise _fail(
+                "invalid_input",
                 f"This format doesn't offer {word} {body[key]!r}; it offers {', '.join(sorted(valid))}. "
                 "Nothing was charged."
             )
@@ -360,6 +389,7 @@ def _check_choices(config: Any, body: dict[str, Any]) -> None:
 # The web app's dashboard order (app/lib/settled.ts): videos still being made first.
 _STATUS_ORDER = {"processing": 0, "pending": 1, "paused": 2, "ready": 3, "complete": 4, "failed": 5, "cancelled": 6}
 _HIDDEN_BY_DEFAULT = {"failed", "cancelled"}
+_RETRYABLE = {"failed", "cancelled", "paused"}
 _SHOW = {
     "in_progress": {"processing", "pending", "paused"},
     "ready": {"ready", "complete"},
@@ -582,10 +612,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         narrator_voice: Annotated[str | None, Field(max_length=64, description="Optional narrator voice.")] = None,
         narration_language: Annotated[str | None, Field(max_length=64, description="Optional narration language.")] = None,
         music_track: Annotated[str | None, Field(max_length=128, description="Optional music track identifier.")] = None,
-        expected_credits: Annotated[int | None, Field(ge=0, description=(
-            "Required with confirm=true: the estimated_credits from the preview the user approved. "
-            "If the price changed since, nothing is charged and the new price comes back."
-        ))] = None,
+        preview_token: PreviewToken = None,
         idempotency_key: Annotated[str | None, Field(min_length=1, max_length=200, description=(
             "Leave out: retries of the same video are recognized automatically and never charge "
             "twice. Pass a new made-up key only when the user deliberately wants a second copy "
@@ -599,17 +626,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Do: ask the topic, then offer quality (mode labels; Standard recommended). Ask about
         format, length, sound, voice or style only if the user wants to choose; otherwise
         leave the defaults (auto). Show the preview's ``summary``, ``adjustments`` and any
-        ``warning``, get a yes, then call again with confirm=true and
-        expected_credits=<the preview's estimated_credits>. For several videos, preview the
-        total first.
+        ``warning``, get a yes, then call again with the same settings, confirm=true and the
+        preview's ``preview_token``. For several videos, preview the total first. To try a
+        failed video again use retry_video, not this.
         Don't: say the video is ready (it takes a few minutes), poll in a loop, or invent
         voice/style/music ids (they are refused before any charge).
-        Returns: without confirm, a preview (status "needs_approval"). With confirm, the video
+        Returns: without confirm, a preview (status "needs_approval") with ``settings``: what
+        will really run, which confirm checks and sends exactly. With confirm, the video
         (status_label "In line" = accepted, NOT finished), ``credits_cost`` (the exact charge),
         ``replayed`` when this exact video already existed (no new charge), and ``summary``.
         Example: "make a 30s video about the Roman empire" -> create_video(niche, total_length=30)
         shows "18 credits. You have 120, enough for about 6 like this."; on "yes" ->
-        create_video(niche, total_length=30, expected_credits=18, confirm=true).
+        create_video(niche, total_length=30, preview_token="p-...", confirm=true).
         Example: the call timed out -> call again with the same settings; it never charges twice.
         """
         body = _create_params(
@@ -632,36 +660,40 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             audio_mode=audio_mode, workflow=None, niche=niche,
         )
         quote = await _quote(backend, params, body)
+        settings = _effective(body, quote)
+        token = _preview_token({**settings, "credits": quote.get("estimated_credits")})
         if not confirm:
             return {
                 "status": "needs_approval",
                 **quote,
+                "settings": settings,
+                "preview_token": token,
                 "next_step": (
                     "Show the user the summary (and any adjustments or warning) and ask to go ahead. "
                     "On yes, call create_video again with the same settings, confirm=true and "
-                    f"expected_credits={quote.get('estimated_credits')}."
+                    f"preview_token={token!r}."
                 ),
             }
-        if expected_credits is None:
-            raise ToolError(
-                "Nothing was made. Call create_video without confirm first, show the user the price, "
-                "then confirm with expected_credits from that preview."
-            )
-        if quote.get("estimated_credits") != expected_credits:
-            raise ToolError(
-                f"The price changed from {expected_credits} to {quote.get('estimated_credits')} credits "
-                "since the user approved it. Nothing was charged. Show the new price and ask again."
-            )
-        result = _dict_result(await _api(backend, "POST", "/api/jobs", body=body))
+        _check_token(preview_token, token, "create_video")
+        result = _dict_result(await _api(backend, "POST", "/api/jobs", body=_pinned(body, settings)))
         # A new video comes back as {id, status, credits_cost}; an existing one for the same key
         # comes back whole (with its topic): that is a replay, nothing new was made or charged.
         replayed = "niche" in result
         if replayed and result.get("niche") != body["niche"]:
-            raise ToolError(
+            raise _fail(
+                "invalid_input",
                 f"This idempotency_key was already used for another video ({result.get('niche')!r}, "
                 f"id {result.get('id')}); nothing new was made. Use a new key for a new video."
             )
         row = _job_summary(result)
+        if replayed and row["status"] in _HIDDEN_BY_DEFAULT:
+            return _with_next(
+                {**row, "replayed": True},
+                "Nothing new was made. To try this video again, call retry_video with its id (it "
+                "previews the price first).",
+                f"You tried this exact video before ({row.get('created') or 'earlier'}) and it didn't "
+                "finish, so nothing new was charged. Want me to try it again?",
+            )
         if replayed:
             return _with_next(
                 {**row, "replayed": True},
@@ -674,50 +706,122 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             row,
             "Queued, not ready: a video takes a few minutes. Check with get_video when the user "
             "asks; do not poll in a loop.",
-            f"Your video is in line to be made ({row.get('credits_cost', expected_credits)} credits). "
+            f"Your video is in line to be made ({row.get('credits_cost', quote.get('estimated_credits'))} credits). "
             "It takes a few minutes; ask me to check on it any time.",
         )
 
     @server.tool(
-        title="Stop, pause or redo a video",
+        title="Stop or pause a video",
         annotations=WRITE,
         structured_output=True,
     )
     async def control_video(
         job_id: JobId,
-        action: Annotated[Literal["cancel", "pause", "retry"], Field(description="Job action to perform.")],
+        action: Annotated[Literal["cancel", "pause"], Field(description="Job action to perform.")],
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Use when the user wants to stop, pause, resume or redo one video, after approval.
+        """Use when the user wants to stop or pause one video that is being made, after approval.
 
-        cancel: stops it and refunds the held credits ("cancelling" means the refund lands once
-        it stops). pause: stops it but keeps the hold so retry resumes it without paying again.
-        retry: resumes a paused video for free, but re-makes a failed or cancelled one for its
-        full price again.
-        Do: read it with get_video first; for a retry of a failed or cancelled one, say the
-        price (credits_cost) before asking.
-        Don't: cancel or pause a ready video (it is refused), or retry in a loop.
-        Returns: the new status, the video, ``summary`` and ``next_step``. Cancel and pause
-        wait up to ~30s for the video to actually stop, so the summary says whether the credits
-        are already back.
-        Example: "retry the failed one" -> get_video shows failed, credits_cost 18 -> "Retrying
-        charges 18 credits again. Go ahead?" -> control_video(job_id, "retry", confirm=true).
+        cancel: stops it and refunds the held credits. pause: stops it but keeps the hold so
+        retry_video resumes it without paying again.
+        Do: read it with get_video first. To resume, or to try a failed one again, use retry_video.
+        Don't: cancel or pause a ready video (it is refused).
+        Returns: the new status, the video, ``summary`` and ``next_step``. Both wait up to ~30s
+        for the video to actually stop, so the summary says whether the credits are already back.
         """
         job_id = await _video_ref(backend, job_id)
         _require_confirmation(confirm, f"Video {action}")
         try:
             result = _dict_result(await _api(backend, "POST", f"/api/jobs/{job_id}/{action}"))
         except ToolError:
-            if action == "retry":
-                raise
             # The backend answers "not found or already finished"; say which, from the video itself.
             job = await _api(backend, "GET", f"/api/jobs/{job_id}")
-            raise ToolError(
+            raise _fail(
+                "wrong_state",
                 f"This video is {_label(job.get('status')).lower()}, so there is nothing to {action}."
             ) from None
-        job = await _settled(backend, job_id) if action != "retry" else {}
+        job = await _settled(backend, job_id)
         return _with_next({**result, **_job_summary(job)} if job else result, _CONTROL_NEXT[action],
                           _control_summary(action, result.get("status"), job))
+
+    @server.tool(
+        title="Try a video again",
+        annotations=WRITE,
+        meta=ASK_EVERY_TIME,
+        structured_output=True,
+    )
+    async def retry_video(
+        job_id: JobId,
+        preview_token: PreviewToken = None,
+        confirm: Confirm = False,
+    ) -> dict[str, Any]:
+        """Use when the user wants to try a failed or cancelled video again, or resume a paused
+        one. Call it first without confirm to get a preview, then with confirm=true after a yes.
+
+        A paused video resumes where it stopped, for free. A failed or cancelled one is made
+        again from the start and costs its price again (it was refunded when it stopped).
+        Do: show the preview's ``summary`` (price, balance, any ``warning``) and get a yes.
+        Don't: retry in a loop, or use create_video for this: the same settings bring back the
+        old video instead of making it again.
+        Returns: without confirm, a preview (status "needs_approval", ``credits``,
+        ``preview_token``). With confirm, the video, now in line to be made, and ``summary``.
+        Example: "try the marble one again" -> retry_video("marble") shows "Trying it again
+        costs 18 credits. You have 120." -> on yes retry_video("marble", preview_token=..., confirm=true).
+        """
+        job_id = await _video_ref(backend, job_id)
+        now = datetime.now(UTC)
+        job, credits, recent = await asyncio.gather(
+            _api(backend, "GET", f"/api/jobs/{job_id}"),
+            _api(backend, "GET", "/api/payments/credit-status"),
+            _api(backend, "GET", "/api/jobs", params={"updated_since": (now - timedelta(hours=1)).isoformat()}),
+        )
+        row = _job_summary(_dict_result(job))
+        status = row["status"]
+        if status not in _RETRYABLE:
+            raise _fail(
+                "wrong_state",
+                f"This video is {row['status_label'].lower()}, so there is nothing to try again. "
+                "Only a video that failed, was cancelled or is paused can be.",
+            )
+        cost = 0 if status == "paused" else int(row.get("credits_cost") or 0)
+        token = _preview_token({"video": job_id, "status": status, "credits": cost})
+        if confirm:
+            _check_token(preview_token, token, "retry_video")
+            await _api(backend, "POST", f"/api/jobs/{job_id}/retry")
+            return _with_next(
+                _job_summary({**_dict_result(job), "status": "pending"}),
+                "Queued, not ready. Check with get_video when the user asks; do not poll in a loop.",
+                ("Resumed for free. " if status == "paused" else f"Trying it again ({cost:,} credits). ")
+                + "It takes a few minutes; ask me to check on it any time.",
+            )
+        balance = _dict_result(credits).get("balance")
+        name = f"\"{row.get('title')}\"" if row.get("title") else "This video"
+        if status == "paused":
+            summary = f"{name} is paused. Resuming is free; it carries on where it stopped."
+        elif isinstance(balance, int | float) and balance < cost:
+            summary = (f"Trying {name} again costs {cost:,} credits but you have {balance:,}. "
+                       f"You can add credits at {BILLING_URL}.")
+        else:
+            summary = f"Trying {name} again costs {cost:,} credits" + (
+                f". You have {balance:,}." if isinstance(balance, int | float) else ".")
+        preview = {
+            **row,
+            "status": "needs_approval",
+            "credits": cost,
+            "preview_token": token,
+            "summary": summary,
+            "next_step": "Show the summary and ask to go ahead. On yes, call retry_video again with "
+                         f"confirm=true and preview_token={token!r}.",
+        }
+        if isinstance(balance, int | float):
+            preview.update(balance=balance, can_afford=balance >= cost)
+        failures = _recent_failures(recent, now)
+        if status != "paused" and failures >= 2:
+            preview["warning"] = (
+                f"{failures} of your videos failed in the last hour, so this one may fail again. "
+                "Credits come back if it does, but it may be better to wait a little."
+            )
+        return preview
 
     @server.tool(
         title="Edit video title and details",
@@ -752,7 +856,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             visibility=visibility,
         )
         if not body:
-            raise ToolError("Provide at least one detail to change.")
+            raise _fail("invalid_input", "Provide at least one detail to change.")
         before = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
         result = _dict_result(await _api(backend, "PATCH", f"/api/jobs/{job_id}", body=body))
         changed = {k: {"from": before.get(k), "to": v} for k, v in body.items() if before.get(k) != v}

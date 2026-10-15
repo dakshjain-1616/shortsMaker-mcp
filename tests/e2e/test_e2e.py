@@ -155,13 +155,13 @@ def call(stack, tool, args=None, **kw):
 
 
 def make_video(stack, args, **kw):
-    """Make a video the way an agent must: preview, then confirm with the previewed price."""
+    """Make a video the way an agent must: preview, then confirm with the preview's token."""
     args = {k: v for k, v in args.items() if k != "confirm"}
     preview = call(stack, "create_video", args, **kw)
     if preview.is_error:
         return preview
-    price = preview.structured_content["estimated_credits"]
-    return call(stack, "create_video", {**args, "expected_credits": price, "confirm": True}, **kw)
+    token = preview.structured_content["preview_token"]
+    return call(stack, "create_video", {**args, "preview_token": token, "confirm": True}, **kw)
 
 
 def text(result) -> str:
@@ -176,7 +176,7 @@ def test_tool_and_prompt_catalogue(stack):
     prompts = run(stack, lambda c: c.list_prompts()).prompts
     names = {t.name for t in tools}
 
-    assert len(tools) == 29 and len(prompts) == 4
+    assert len(tools) == 30 and len(prompts) == 4
     # Clients already group tools under the server name, so names are bare snake_case verbs.
     assert all(re.fullmatch(r"[a-z]+(_[a-z]+)+", n) and len(n) <= 64 for n in names), names
     for tool in tools:
@@ -191,7 +191,7 @@ def test_modern_protocol_discovers_and_calls_a_read_tool(stack, path):
     async def verify(client):
         assert client.protocol_version == "2026-07-28"
         assert client.session.discover_result is not None
-        assert len((await client.list_tools()).tools) == 29
+        assert len((await client.list_tools()).tools) == 30
         result = await client.call_tool("get_credits", {})
         assert result.structured_content == {"balance": 100, "summary": "You have 100 credits."}
 
@@ -207,7 +207,7 @@ def test_initialize_and_tools_work_across_separate_instances(stack):
     # This instance has never received initialize and has no shared process memory.
     listed = httpx.post(f"{stack['replica']}/mcp/", headers=headers,
                        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-    assert listed.status_code == 200 and len(listed.json()["result"]["tools"]) == 29
+    assert listed.status_code == 200 and len(listed.json()["result"]["tools"]) == 30
     assert "mcp-session-id" not in listed.headers
     called = httpx.post(f"{stack['replica']}/mcp/", headers=headers, json={
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -347,10 +347,14 @@ def test_create_video_end_to_end_and_summary_strips_large_fields(stack):
     assert preview["summary"].startswith("This video costs 10 credits. You have 100, enough for about 10")
     assert all(c["method"] == "GET" for c in backend_calls(stack))  # a preview never writes
 
+    assert preview["settings"]["total_length"] == 60
     created = call(stack, "create_video", {
-        "niche": "  deep sea  ", "total_length": 90, "expected_credits": 10, "confirm": True,
+        "niche": "  deep sea  ", "total_length": 90, "preview_token": preview["preview_token"], "confirm": True,
     }).structured_content
     assert created["status_label"] == "In line" and "replayed" not in created
+    # The job is made with the previewed (snapped) length, not re-resolved from the ask.
+    post = next(c for c in backend_calls(stack) if c["method"] == "POST")
+    assert post["body"]["total_length"] == 60
     assert "config" not in created and "owner" not in created
     assert call(stack, "get_credits").structured_content == {"balance": 90, "summary": "You have 90 credits."}
     fetched = call(stack, "get_video", {"job_id": "deep sea"}).structured_content  # found by name
@@ -367,9 +371,28 @@ def test_retried_create_without_a_key_is_a_replay_not_a_second_charge(stack):
 
 
 def test_price_lock_refuses_a_stale_approval_before_any_write(stack):
-    result = call(stack, "create_video", {"niche": "x", "total_length": 15, "expected_credits": 7, "confirm": True})
-    assert result.is_error and "changed from 7 to 10" in text(result) and "Nothing was charged" in text(result)
+    result = call(stack, "create_video", {"niche": "x", "total_length": 15, "preview_token": "p-stale", "confirm": True})
+    assert result.is_error and "[code: preview_changed]" in text(result) and "Nothing was done" in text(result)
+    # A preview for other settings doesn't approve these.
+    other = call(stack, "create_video", {"niche": "y", "total_length": 15}).structured_content["preview_token"]
+    result = call(stack, "create_video", {"niche": "x", "total_length": 15, "preview_token": other, "confirm": True})
+    assert result.is_error and "[code: preview_changed]" in text(result)
     assert all(c["method"] == "GET" for c in backend_calls(stack))
+
+
+def test_a_failed_video_is_tried_again_with_retry_video_not_create(stack):
+    args = {"niche": "failed-marble", "total_length": 15}
+    first = make_video(stack, args).structured_content
+    again = make_video(stack, args).structured_content
+    assert again["replayed"] is True and "retry_video" in again["next_step"]
+    preview = call(stack, "retry_video", {"job_id": first["id"]}).structured_content
+    assert preview["status"] == "needs_approval" and preview["credits"] == 10
+    assert call(stack, "get_credits").structured_content["balance"] == 90  # a preview never charges
+    done = call(stack, "retry_video", {"job_id": first["id"], "preview_token": preview["preview_token"], "confirm": True})
+    assert not done.is_error and done.structured_content["status_label"] == "In line"
+    assert call(stack, "get_credits").structured_content["balance"] == 80
+    refused = call(stack, "retry_video", {"job_id": first["id"]})
+    assert refused.is_error and "[code: wrong_state]" in text(refused)
 
 
 def test_list_videos_pages_newest_first_with_next_offset(stack):
@@ -457,6 +480,7 @@ WRITE_ARGS = {
     "control_series_slot": {"slot_id": UUID0, "action": "skip"},
     "create_video": {"niche": "x", "total_length": 15, "idempotency_key": "k"},
     "control_video": {"job_id": UUID0, "action": "cancel"},
+    "retry_video": {"job_id": UUID0},
     "update_video_details": {"job_id": UUID0, "title": "t"},
     "connect_account": {"platform": "youtube"},
     "disconnect_account": {"connection_id": UUID0},
@@ -465,7 +489,7 @@ WRITE_ARGS = {
 }
 
 
-PREVIEW_TOOLS = {"create_video", "create_series", "publish_video", "update_series"}
+PREVIEW_TOOLS = {"create_video", "create_series", "publish_video", "update_series", "retry_video"}
 
 
 def test_every_write_tool_refuses_without_confirmation_and_never_reaches_backend(stack):
@@ -558,7 +582,8 @@ def test_unicode_and_boundary_values_are_accepted(stack):
     result = make_video(stack, args)
     assert not result.is_error, text(result)
     sent = next(c for c in backend_calls(stack) if c["method"] == "POST")["body"]
-    assert sent["total_length"] == 3600 and sent["niche"].startswith("日本語 🌊")
+    # The longest ask is accepted; the job carries the length the preview resolved it to.
+    assert sent["total_length"] == 60 and sent["niche"].startswith("日本語 🌊")
 
 
 def test_read_filters_still_accept_naive_updated_since(stack):
@@ -712,7 +737,7 @@ def test_client_protocols_publish_oauth_tool_metadata(stack, version):
     })
     assert response.status_code == 200
     tools = response.json()['result']['tools']
-    assert len(tools) == 29
+    assert len(tools) == 30
     for tool in tools:
         scope = 'mcp:read' if tool['annotations']['readOnlyHint'] else 'mcp:write'
         expected = [{'type': 'oauth2', 'scopes': [scope]}]

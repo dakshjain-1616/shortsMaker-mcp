@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
-from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import AwareDatetime, Field
 
 from ..backend_client import BackendClient
@@ -22,18 +21,24 @@ from ._common import (
     READ_ONLY,
     WRITE,
     Confirm,
+    PreviewToken,
     WorkflowId,
     WorkflowSlotId,
     _account_refs,
     _api,
     _bounded_text,
+    _check_token,
     _clean_tags,
     _dedupe_ids,
     _dict_result,
+    _fail,
     _items,
     _label,
     _optional_params,
     _parse_time,
+    _post_state,
+    _preview_token,
+    _public_text,
     _require_confirmation,
     _series_ref,
     _when,
@@ -47,18 +52,18 @@ def _workflow_days(days: list[int]) -> list[int]:
         isinstance(day, bool) or not isinstance(day, int) or day < 0 or day > 6
         for day in days
     ):
-        raise ToolError("days_of_week must contain 1-7 values from 0 (Monday) through 6 (Sunday).")
+        raise _fail("invalid_input", "days_of_week must contain 1-7 values from 0 (Monday) through 6 (Sunday).")
     return sorted(set(days))
 
 def _workflow_times(times: list[str]) -> list[str]:
     if not times or len(times) > 8:
-        raise ToolError("times_of_day must contain 1-8 values in HH:MM 24-hour form.")
+        raise _fail("invalid_input", "times_of_day must contain 1-8 values in HH:MM 24-hour form.")
     if not all(isinstance(time, str) for time in times):
-        raise ToolError("times_of_day must contain values in HH:MM 24-hour form.")
+        raise _fail("invalid_input", "times_of_day must contain values in HH:MM 24-hour form.")
     cleaned = sorted({time.strip() for time in times})
     if any(len(time) != 5 or time[2] != ":" or not time[:2].isdigit() or not time[3:].isdigit()
            or int(time[:2]) > 23 or int(time[3:]) > 59 for time in cleaned):
-        raise ToolError("times_of_day must contain values in HH:MM 24-hour form.")
+        raise _fail("invalid_input", "times_of_day must contain values in HH:MM 24-hour form.")
     return cleaned
 
 # A series video is priced from these when they are made; without mode and length the backend
@@ -72,7 +77,7 @@ def _check_timezone(timezone: str | None) -> None:
     try:
         ZoneInfo(timezone.strip())
     except (ZoneInfoNotFoundError, ValueError):
-        raise ToolError(
+        raise _fail("invalid_input", 
             f"Unknown timezone {timezone!r}. Use an IANA name like 'America/New_York' or "
             "'Europe/London'; ask the user where they are if unsure."
         ) from None
@@ -80,12 +85,12 @@ def _check_timezone(timezone: str | None) -> None:
 
 def _check_ends_at(ends_at: datetime | None) -> None:
     if ends_at is not None and ends_at <= datetime.now(UTC):
-        raise ToolError("ends_at is in the past. Ask the user for a future end date, or omit it to run until stopped.")
+        raise _fail("invalid_input", "ends_at is in the past. Ask the user for a future end date, or omit it to run until stopped.")
 
 
 def _check_length(defaults: dict[str, Any]) -> None:
     if not defaults.get("total_length"):
-        raise ToolError(
+        raise _fail("invalid_input", 
             "job_defaults.total_length is required: the length in seconds of each video. "
             "Offer the user lengths from get_video_options(format=...)."
         )
@@ -298,7 +303,53 @@ def _series_summary(view: dict[str, Any]) -> str:
         text += f" Next video {view['next_video']}."
     if view.get("status") == "paused" and view.get("last_error"):
         text += f" {view['last_error']}"
+    failed = (view.get("counts") or {}).get("failed")
+    if isinstance(failed, int) and failed:
+        text += f" {failed} of its videos didn't work; I can show why."
     return text
+
+
+def _slot_fix(slot: dict[str, Any], posting: list[dict[str, Any]]) -> str | None:
+    """The one thing that recovers a slot, in words the user can say yes to."""
+    error = str(slot.get("last_error") or "").lower()
+    if slot.get("status") == "failed":
+        return "Try it again (costs credits)"
+    if slot.get("status") == "skipped" and "credit" in error:
+        return "Add credits, then try it again"
+    return next((post["fix"] for post in posting if post.get("fix")), None)
+
+
+def _slot_row(slot: dict[str, Any], tz: str | None, now: datetime) -> dict[str, Any]:
+    """One upcoming or past video of a series: its own status, its video's, each post's, the
+    last error, when it is tried again, and what fixes it."""
+    posting = [
+        {
+            "account": f"{p.get('account_name') or 'your account'} ({_PLATFORM.get(p.get('platform'), p.get('platform'))})",
+            **_post_state(p, now),
+            **({"last_error": _public_text(p["last_error"])} if p.get("last_error") else {}),
+        }
+        for p in slot.get("posts") or [] if isinstance(p, dict)
+    ]
+    attempts = slot.get("attempts") or 0
+    retry_at = _parse_time(slot.get("next_attempt_at"))
+    retrying = slot.get("status") == "planned" and attempts and slot.get("last_error")
+    row = {
+        "id": slot.get("id"),
+        "when": _when(slot.get("slot_at"), tz, now=now),
+        "title": slot.get("title") or "Idea not written yet",
+        "prompt": slot.get("prompt"),
+        "status": slot.get("status"),
+        "status_label": _label(slot.get("status")),
+        **({"video": _label(slot["job_status"])} if slot.get("job_id") and slot.get("job_status") else {}),
+        **({"posting": posting} if posting else {}),
+        **({"last_error": slot["last_error"]} if slot.get("last_error") else {}),
+        **({"tries": f"{attempts} of {slot.get('max_attempts') or '?'}"}
+           if attempts and slot.get("status") in ("planned", "failed") and slot.get("last_error") else {}),
+        **({"next_try": _when(retry_at, tz, now=now)} if retrying and retry_at and retry_at > now else {}),
+        **({"thumbnail": slot["thumbnail_url"]} if slot.get("thumbnail_url") else {}),
+    }
+    fix = _slot_fix(slot, posting)
+    return {**row, "fix": fix} if fix else row
 
 
 _LIFECYCLE_ORDER = {"active": 0, "paused": 1, "stopped": 2}
@@ -410,13 +461,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         upcoming videos before they are made, or asks why one was skipped or failed.
 
         By default it shows the next few upcoming videos, soonest first, with when (in the
-        series timezone), title and idea (``prompt``).
-        Do: offer, for each, to keep it, edit it (update_series_slot), get a new idea
-        (control_series_slot regenerate_idea) or skip it (control_series_slot skip). Quote a
-        failed or skipped one's last_error.
+        series timezone), title and idea (``prompt``), plus ``needs_attention``: videos from the
+        last 7 days that failed, were skipped for credits, or whose post failed.
+        Each row can carry ``video`` (its video's status), ``posting`` (each account's post
+        state, as in list_posts: "sent" is not confirmed live), ``last_error``, ``tries``
+        ("2 of 3"), ``next_try`` (when it is tried again automatically) and ``fix`` (the one
+        thing that recovers it, in words for the user: "Try it again" = control_series_slot
+        retry, "Reconnect the account" = connect_account, "Retry the post" = control_post retry).
+        Do: offer, for each upcoming one, to keep it, edit it (update_series_slot), get a new
+        idea (control_series_slot regenerate_idea) or skip it (control_series_slot skip). For
+        each needing attention, quote last_error and offer its ``fix``.
         Don't: change anything from here without the user's approval.
-        Returns: ``items`` (id, when, title, prompt, status_label, last_error), ``count`` and
-        ``summary``.
+        Returns: ``items``, ``needs_attention``, ``count`` and ``summary``.
         """
         series_id = await _series_ref(backend, series_id)
         upcoming = status is None and from_time is None and to_time is None
@@ -430,41 +486,47 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "to": now + timedelta(days=14) if upcoming else to_time,
             },
         )
-        series, slots = await asyncio.gather(
+        slots_path = f"/api/workflows/{series_id}/slots"
+        series, slots, recent = await asyncio.gather(
             _api(backend, "GET", f"/api/workflows/{series_id}"),
-            _api(backend, "GET", f"/api/workflows/{series_id}/slots", params=params),
+            _api(backend, "GET", slots_path, params=params),
+            # The last week, for what went wrong; only in the default view.
+            _api(backend, "GET", slots_path, params={"from": now - timedelta(days=7), "to": now})
+            if upcoming else asyncio.sleep(0, []),
         )
         series = _dict_result(series)
-        slots = [slot for slot in slots if isinstance(slot, dict)] if isinstance(slots, list) else []
+        tz = series.get("timezone")
+
+        def dicts(value: Any) -> list[dict[str, Any]]:
+            return [slot for slot in value if isinstance(slot, dict)] if isinstance(value, list) else []
+
+        slots = dicts(slots)
         if upcoming:
             slots = sorted(
                 (slot for slot in slots if slot.get("status") in ("planned", "generating")),
                 key=lambda slot: slot.get("slot_at") or "",
             )
-        rows = [
-            {
-                "id": slot.get("id"),
-                "when": _when(slot.get("slot_at"), series.get("timezone")),
-                "title": slot.get("title") or "Idea not written yet",
-                "prompt": slot.get("prompt"),
-                "status": slot.get("status"),
-                "status_label": _label(slot.get("status")),
-                **({"last_error": slot["last_error"]} if slot.get("last_error") else {}),
-                **({"thumbnail": slot["thumbnail_url"]} if slot.get("thumbnail_url") else {}),
-            }
-            for slot in slots[:limit]
-        ]
+        rows = [_slot_row(slot, tz, now) for slot in slots[:limit]]
+        # Newest first; a row needs attention exactly when there is something to fix.
+        attention = [row for row in (_slot_row(slot, tz, now) for slot in sorted(
+            dicts(recent), key=lambda slot: slot.get("slot_at") or "", reverse=True,
+        )) if "fix" in row][:5]
         name = series.get("name") or "your series"
         if not rows:
             summary = f"Nothing upcoming in \"{name}\" right now."
         else:
             summary = f"Next in \"{name}\": " + "; ".join(f"{r['when']}: \"{r['title']}\"" for r in rows) + "."
-        out = _items(
-            rows,
-            "Offer to keep, edit, re-idea or skip any of them." if upcoming and rows else None,
-            summary,
-        )
-        return {**out, "series_name": name, "shown_as_gallery": shown_as_gallery(ctx)}
+        retrying = [row for row in rows if row.get("next_try")]
+        if retrying:
+            summary += f" {len(retrying)} will be tried again automatically ({retrying[0]['next_try']} next)."
+        if attention:
+            summary += (f" {len(attention)} from the last week need{'s' if len(attention) == 1 else ''} "
+                        "attention: " + "; ".join(f"\"{r['title']}\" ({r['fix']})" for r in attention) + ".")
+        next_step = "Offer to keep, edit, re-idea or skip any of them." if upcoming and rows else None
+        if attention:
+            next_step = ((next_step or "") + " For each in needs_attention, quote last_error and offer its fix.").strip()
+        out = _items(rows, next_step, summary)
+        return {**out, "needs_attention": attention, "series_name": name, "shown_as_gallery": shown_as_gallery(ctx)}
 
     @server.tool(
         title="Start a series",
@@ -507,6 +569,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "Video settings for every video, using create_video's keys: format, style, "
                 "total_length, audio_mode, mode, resolution, narrator_voice, narration_language, music_track."
             ))] = None,
+        preview_token: PreviewToken = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
         """Use when the user wants a series that makes and posts a new video on a schedule. Call
@@ -525,7 +588,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Example: "post a space fact every weekday at 9am on my YouTube" -> ask timezone and
         visibility, then create_series(theme="space facts", connection_ids=["my YouTube"],
         timezone="Europe/London", days_of_week=[0,1,2,3,4], times_of_day=["09:00"],
-        visibility="public") for the preview; on "yes" call again with confirm=true.
+        visibility="public") for the preview; on "yes" call again with confirm=true and the
+        preview's preview_token.
         """
         _check_timezone(timezone)
         _check_ends_at(ends_at)
@@ -557,6 +621,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         )
         accounts = _account_names(connections)
         schedule = _schedule_line(body, accounts)
+        token = _preview_token({**body, "credits": quote.get("estimated_credits")})
         if not confirm:
             cost = _weekly_cost(quote.get("estimated_credits"), body, _dict_result(credits).get("balance"))
             summary = f"\"{body['name']}\": {schedule}."
@@ -577,8 +642,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "schedule": schedule,
                 **cost,
                 "summary": summary,
-                "next_step": "Show the summary and ask to start it. On yes, call create_series again with the same values and confirm=true.",
+                "preview_token": token,
+                "next_step": "Show the summary and ask to start it. On yes, call create_series again with the "
+                             f"same values, confirm=true and preview_token={token!r}.",
             }
+        _check_token(preview_token, token, "create_series")
         created = _dict_result(await _api(backend, "POST", "/api/workflows", body=body))
         view = await _first_slot(backend, created)
         first = f" First video {view['next_video']}." if view.get("next_video") else (
@@ -653,7 +721,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             job_defaults=job_defaults,
         )
         if not body:
-            raise ToolError("Provide at least one series field to update.")
+            raise _fail("invalid_input", "Provide at least one series field to update.")
         current, accounts = await asyncio.gather(
             _live(backend, await _api(backend, "GET", f"/api/workflows/{series_id}")),
             _api(backend, "GET", "/api/connections"),
@@ -824,7 +892,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             slot_at=slot_at,
         )
         if not body:
-            raise ToolError("Provide at least one slot field to update.")
+            raise _fail("invalid_input", "Provide at least one slot field to update.")
         slot = _dict_result(await _api(backend, "PATCH", f"/api/workflow-slots/{slot_id}", body=body))
         return _with_next(
             slot,
@@ -863,7 +931,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 f"New idea: \"{slot.get('title') or 'untitled'}\". Keep it, or ask for another.",
             )
         if suggested_changes is not None:
-            raise ToolError("suggested_changes is only valid for regenerate_idea.")
+            raise _fail("invalid_input", "suggested_changes is only valid for regenerate_idea.")
         return _with_next(
             await _api(backend, "POST", f"/api/workflow-slots/{slot_id}/{action}"),
             "Skipped; this video will not be made." if action == "skip"

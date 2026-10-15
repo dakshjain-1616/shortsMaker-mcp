@@ -7,8 +7,10 @@ conversation into a credit-spending or publishing action.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -113,22 +115,22 @@ def _bounded_text(
 ) -> str | None:
     if value is None:
         if required:
-            raise ToolError(f"{name} is required.")
+            raise _fail("invalid_input", f"{name} is required.")
         return None
     cleaned = value.strip()
     if not cleaned:
         if required:
-            raise ToolError(f"{name} is required.")
+            raise _fail("invalid_input", f"{name} is required.")
         return None
     if len(cleaned) > max_length:
-        raise ToolError(f"{name} must be {max_length} characters or fewer.")
+        raise _fail("invalid_input", f"{name} must be {max_length} characters or fewer.")
     return cleaned
 
 def _clean_tags(tags: list[str] | None) -> list[str] | None:
     if tags is None:
         return None
     if len(tags) > 100:
-        raise ToolError("tags must contain 100 items or fewer.")
+        raise _fail("invalid_input", "tags must contain 100 items or fewer.")
     return [
         _bounded_text(tag, "tag", 200, required=True)  # type: ignore[arg-type]
         for tag in tags
@@ -137,9 +139,9 @@ def _clean_tags(tags: list[str] | None) -> list[str] | None:
 def _dedupe_ids(connection_ids: list[Any]) -> list[str]:
     values = list(dict.fromkeys(str(value) for value in connection_ids))
     if not values:
-        raise ToolError("connection_ids must contain at least one connected account.")
+        raise _fail("invalid_input", "connection_ids must contain at least one connected account.")
     if len(values) > 20:
-        raise ToolError("connection_ids must contain 20 accounts or fewer.")
+        raise _fail("invalid_input", "connection_ids must contain 20 accounts or fewer.")
     return values
 
 def _dict_result(result: Any) -> dict[str, Any]:
@@ -162,7 +164,7 @@ def _items(result: Any, next_step: str | None = None, summary: str | None = None
 
 
 # One plain label per status, whatever the backend spells it ("queued"/"pending",
-# "cancelled"/"canceled"). Slot and post statuses share the table.
+# "cancelled"/"canceled"). Videos, series, slots and accounts; posts use POST_STATES.
 STATUS_LABEL = {
     "queued": "In line",
     "pending": "In line",
@@ -170,6 +172,7 @@ STATUS_LABEL = {
     "generating": "Being made",
     "paused": "Paused",
     "ready": "Ready",
+    "succeeded": "Ready",
     "complete": "Ready",
     "failed": "Didn't work, credits returned",
     "cancelled": "Cancelled",
@@ -177,9 +180,6 @@ STATUS_LABEL = {
     "planned": "Planned",
     "promoted": "Made",
     "skipped": "Skipped",
-    "scheduled": "Waiting to post",
-    "publishing": "Posting now",
-    "published": "Posted",
     "active": "Running",
     "stopped": "Stopped",
     "error": "Needs reconnecting",
@@ -240,9 +240,75 @@ def _when(value: Any, tz: str | None = None, *, now: datetime | None = None) -> 
     clock = f"{local:%I:%M %p}".lstrip("0")
     return f"{day} {clock} {local.tzname()}"
 
+# The seven publishing states the user hears. The backend has five statuses; due-now vs later
+# (queued/scheduled) and confirmed vs unconfirmed (published/sent) are told apart here.
+POST_STATES = {
+    "queued": "Waiting to go out",
+    "scheduled": "Scheduled",
+    "publishing": "Posting now",
+    "sent": "Sent, not confirmed live",
+    "published": "Live",
+    "failed": "Didn't post",
+    "cancelled": "Cancelled",
+}
+# ponytail: keyword match on the platform's error text; a backend error code would be exact.
+_ACCOUNT_TROUBLE = ("reconnect", "auth", "token", "revoked", "expired", "permission", "consent")
+
+
+def _post_state(post: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """One post as the user hears it: ``state`` (a POST_STATES key), ``status_label``, and when
+    it applies ``when``, ``next_try``, ``tries`` and ``fix``. A post the platform accepted but
+    gave no link for is "sent", never "live"."""
+    now = now or datetime.now(UTC)
+    status, attempts = post.get("status"), post.get("attempts") or 0
+    out: dict[str, Any] = {}
+    if status == "scheduled":
+        at, retry_at = _parse_time(post.get("scheduled_at")), _parse_time(post.get("next_attempt_at"))
+        if attempts:
+            state, label = "queued", "Trying again" + (f" {_when(retry_at, now=now)}" if retry_at and retry_at > now else "")
+            out["tries"] = f"{attempts} of {post.get('max_attempts') or '?'}"
+            if retry_at and retry_at > now:
+                out["next_try"] = _when(retry_at, now=now)
+        elif at and at > now + timedelta(minutes=1):
+            state, label = "scheduled", f"Goes out {_when(at, now=now)}"
+            out["when"] = "goes out " + _when(at, now=now)
+        else:
+            state, label = "queued", POST_STATES["queued"]
+    elif status == "published":
+        state = "published" if post.get("platform_post_url") else "sent"
+        label = POST_STATES[state]
+        if post.get("published_at"):
+            out["when"] = "posted " + _when(post["published_at"], now=now)
+    elif status == "failed":
+        state, label = "failed", POST_STATES["failed"]
+        error = str(post.get("last_error") or "").lower()
+        out["fix"] = (
+            "Reconnect the account, then retry the post"
+            if any(word in error for word in _ACCOUNT_TROUBLE) else "Retry the post"
+        )
+    else:
+        state = {"canceled": "cancelled"}.get(status, str(status or "unknown"))
+        label = POST_STATES.get(state) or _label(status)
+    return {"state": state, "status_label": label, **out}
+
+
 _URL = re.compile(r"https?://\S+")
 
-# Fallbacks for when the backend gives no sentence of its own. 401/403/429/5xx always use these:
+def _fail(code: str, message: str) -> ToolError:
+    """A sentence the user can hear, then a stable code the agent acts on (see INSTRUCTIONS)."""
+    return ToolError(f"{message} [code: {code}]")
+
+
+# The backend sends only {"detail": "..."}; the HTTP status decides the code (other 4xx: invalid_input).
+_CODES = {
+    401: "connector_auth",
+    402: "insufficient_credits",
+    403: "not_available_here",
+    404: "not_found",
+    409: "wrong_state",
+    429: "rate_limited",
+}
+# Fallbacks for when the backend gives no sentence of its own. 401/403/429 always use these:
 # 401 and 403 here mean connector configuration, not something the user can fix in chat.
 _FALLBACK = {
     401: "Faceless Video Maker could not verify this connector's backend access. Ask the connector administrator to check its configuration.",
@@ -250,7 +316,7 @@ _FALLBACK = {
     403: f"This action isn't available through the connector yet. The user can do it on the website ({APP_URL}).",
     404: "Not found.",
     409: "Not allowed in the item's current state.",
-    429: "Too many requests. Wait a minute before trying again; do not retry in a loop.",
+    429: "Too many requests; do not retry in a loop.",
 }
 # A next step for the model, added after the backend's own sentence.
 _NEXT_STEP = {
@@ -261,15 +327,16 @@ _NEXT_STEP = {
 
 
 # Known raw engine/backend messages, rewritten for a non-technical user. Matched by substring.
-_ENGINE_TROUBLE = "Video making is having trouble right now. Try again in a few minutes."
+_ENGINE_TROUBLE = "Video making is having trouble right now."
 _FRIENDLY = (
     ("engine unavailable", _ENGINE_TROUBLE),
     ("can't price this video", _ENGINE_TROUBLE),
     ("_key not set", _ENGINE_TROUBLE),
-    ("something went wrong on our side", "Something went wrong on our side. Try again in a minute."),
 )
 # FastAPI validation text arrives as "times_of_day.0: Value error, Time must be HH:MM"; keep the sentence.
 _FIELD_PREFIX = re.compile(r"(^|; )[\w.]+: (Value error, )?")
+# A 500 says "Something went wrong on our side. Reference <request id>"; support needs the id.
+_REFERENCE = re.compile(r"Reference ([\w-]+)")
 
 
 def _public_text(text: str) -> str:
@@ -281,38 +348,80 @@ def _public_text(text: str) -> str:
     return _FIELD_PREFIX.sub(r"\1", _URL.sub("[link]", text)).strip()[:300]
 
 
+def _wait(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    return f" Try again in about {seconds} seconds." if seconds < 120 else f" Try again in about {round(seconds / 60)} minutes."
+
+
 def _backend_error(exc: Exception, write: bool = False, spends: bool = False) -> ToolError:
+    unused = " No credits were used." if spends else ""
     if isinstance(exc, BackendUnavailable):
         if write:
             # A timed-out write may still have happened; blind retries could double-charge or double-post.
-            return ToolError(
+            return _fail(
+                "outcome_unknown",
                 "Faceless Video Maker did not answer in time, so this may or may not have gone through. "
-                "Check list_videos or list_posts before trying again; a create_video retry with the SAME "
-                "idempotency_key is always safe."
+                "Check list_videos or list_posts before trying again; asking create_video for the same "
+                "video again is safe, it never charges twice.",
             )
-        return ToolError("Faceless Video Maker is temporarily unavailable. Tell the user and try again in a minute.")
-    if isinstance(exc, BackendAPIError):
-        status = exc.status_code
-        if status >= 500:
-            if _public_text(exc.detail) == _ENGINE_TROUBLE:
-                # Pricing failed, so nothing was held.
-                return ToolError(_ENGINE_TROUBLE + (" No credits were used." if spends else ""))
-            return ToolError("Faceless Video Maker could not complete that request. Try again shortly.")
-        if status in (401, 403, 429) or exc.detail.startswith("Request failed ("):
-            message = _FALLBACK.get(status, "Faceless Video Maker rejected this request. Check the values and try again.")
-        else:
-            message = _public_text(exc.detail)
-        if message and message[-1] not in ".!?":
-            message += "."
-        if spends:
-            # A rejected request never reaches the credit hold.
-            message += " No credits were used."
-        return ToolError(message + _NEXT_STEP.get(status, ""))
-    return ToolError("Faceless Video Maker could not complete that request.")
+        return _fail("service_busy", "Faceless Video Maker is temporarily unavailable. Tell the user and try again in a minute.")
+    if not isinstance(exc, BackendAPIError):
+        return _fail("unexpected", "Faceless Video Maker could not complete that request. Try again shortly.")
+    status = exc.status_code
+    if status >= 500:
+        engine = _public_text(exc.detail) == _ENGINE_TROUBLE
+        if engine or status == 503:
+            # Pricing or the engine failed before any hold, so nothing was charged.
+            reason = _ENGINE_TROUBLE if engine else "Faceless Video Maker is busy right now."
+            return _fail("service_busy", reason + unused + (_wait(exc.retry_after) or " Try again in a few minutes."))
+        reference = _REFERENCE.search(exc.detail)
+        return _fail(
+            "server_error",
+            "Something went wrong on our side. Try again in a minute."
+            + (f" If it keeps happening, give support this reference: {reference.group(1)}." if reference else ""),
+        )
+    if status in (401, 403, 429) or exc.detail.startswith("Request failed ("):
+        message = _FALLBACK.get(status, "Faceless Video Maker rejected this request. Check the values and try again.")
+    else:
+        message = _public_text(exc.detail)
+    if message and message[-1] not in ".!?":
+        message += "."
+    # A rejected request never reaches the credit hold.
+    message += unused + (_wait(exc.retry_after) if status == 429 else "")
+    return _fail(_CODES.get(status, "invalid_input"), message + _NEXT_STEP.get(status, ""))
+
+def _preview_token(approved: dict[str, Any]) -> str:
+    """A fingerprint of exactly what the user approved (settings and price). Confirm recomputes it
+    from a fresh read; any difference means the preview drifted, so nothing runs."""
+    return "p-" + hashlib.sha256(json.dumps(approved, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _check_token(given: str | None, expected: str, tool: str) -> None:
+    if given is None:
+        raise _fail(
+            "needs_approval",
+            f"Nothing was done. Call {tool} without confirm first, show the user the preview, then "
+            "confirm with its preview_token.",
+        )
+    if given != expected:
+        raise _fail(
+            "preview_changed",
+            f"The price or settings changed since the user approved them. Nothing was done. Call {tool} "
+            "without confirm for the new preview and ask the user again.",
+        )
+
+
+PreviewToken = Annotated[str | None, Field(max_length=40, description=(
+    "Required with confirm=true: the preview_token from the preview the user approved. If the "
+    "price or settings changed since, nothing happens and you are told to preview again."
+))]
+
 
 def _require_confirmation(confirm: bool, action: str) -> None:
     if not confirm:
-        raise ToolError(
+        raise _fail(
+            "needs_approval",
             f"{action} was not performed. First show the user the exact action and its "
             "cost/destination, obtain explicit approval, then call again with confirm=true."
         )
@@ -349,11 +458,11 @@ async def _api(
     try:
         principal = current_principal()
     except RuntimeError as exc:
-        raise ToolError("Authentication is missing for this MCP request.") from exc
+        raise _fail("connector_auth", "Authentication is missing for this MCP request.") from exc
 
     required_scope = "mcp:read" if method.upper() == "GET" else "mcp:write"
     if required_scope not in principal.scopes:
-        raise ToolError(f"This tool requires {required_scope} authorization.")
+        raise _fail("connector_auth", f"This tool requires {required_scope} authorization.")
 
     try:
         token = backend.bridge_token(principal)
@@ -399,12 +508,13 @@ def _pick(
     options = matches or items
     listed = "; ".join(f"{describe(item)} [id {item.get('id')}]" for item in options[:6])
     if matches:
-        raise ToolError(
+        raise _fail(
+            "ambiguous_name",
             f"Several {kind}s match {ref!r}: {listed}. Ask the user which one (don't show the ids)."
         )
     if not items:
-        raise ToolError(f"There is no {kind} yet.")
-    raise ToolError(f"No {kind} matches {ref!r}. Recent ones: {listed}. Ask the user which one (don't show the ids).")
+        raise _fail("no_match", f"There is no {kind} yet.")
+    raise _fail("no_match", f"No {kind} matches {ref!r}. Recent ones: {listed}. Ask the user which one (don't show the ids).")
 
 
 async def _video_ref(backend: BackendClient, ref: str) -> str:

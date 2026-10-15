@@ -113,7 +113,7 @@ def test_registered_tools_expose_risk_annotations_and_structured_schemas():
     assert write_tool.annotations.destructive_hint is True
     assert write_tool.output_schema is not None
     assert write_tool.parameters["properties"]["confirm"]["description"]
-    assert "expected_credits" in write_tool.parameters["properties"]
+    assert "preview_token" in write_tool.parameters["properties"]
     assert "idempotency_key" not in write_tool.parameters.get("required", [])
 
 
@@ -145,7 +145,7 @@ def test_create_video_without_confirm_returns_a_preview_and_never_writes():
 
     assert preview["status"] == "needs_approval" and preview["estimated_credits"] == 18
     assert preview["summary"] == "This video costs 18 credits. You have 120, enough for about 6 like this."
-    assert "expected_credits=18" in preview["next_step"]
+    assert preview["preview_token"] in preview["next_step"] and preview["settings"]["total_length"] == 15
     assert {c.args[0] for c in backend.request.await_args_list} == {"GET"}
 
 
@@ -155,11 +155,12 @@ def test_create_video_confirmed_sends_a_stable_automatic_key_under_the_price_loc
     create = server._tool_manager._tools["create_video"].fn
     context = _principal.set(TEST_PRINCIPAL)
     try:
-        result = asyncio.run(create(" deep sea animals ", 15, expected_credits=18, confirm=True))
-        with pytest.raises(ToolError, match="Call create_video without confirm first"):
+        token = asyncio.run(create(" deep sea animals ", 15))["preview_token"]
+        result = asyncio.run(create(" deep sea animals ", 15, preview_token=token, confirm=True))
+        with pytest.raises(ToolError, match="Call create_video without confirm first.*needs_approval"):
             asyncio.run(create("deep sea animals", 15, confirm=True))
-        with pytest.raises(ToolError, match="changed from 12 to 18 credits.*Nothing was charged"):
-            asyncio.run(create("deep sea animals", 15, expected_credits=12, confirm=True))
+        with pytest.raises(ToolError, match="changed since.*Nothing was done.*preview_changed"):
+            asyncio.run(create("deep sea plants", 15, preview_token=token, confirm=True))
     finally:
         _principal.reset(context)
 
@@ -171,6 +172,62 @@ def test_create_video_confirmed_sends_a_stable_automatic_key_under_the_price_loc
     # Same settings, same key: a retry after a timeout can never charge twice.
     assert video._auto_key({**body, "idempotency_key": "x"}) == body["idempotency_key"]
     assert video._auto_key({**body, "total_length": 30}) != body["idempotency_key"]
+
+
+def test_confirm_refuses_when_auto_picks_another_format_and_sends_the_previewed_one():
+    server, backend = _registered_tools()
+    picked = {"format": "drone"}
+
+    async def respond(method, path, token, **kwargs):
+        if path == "/api/resolve":
+            return {"estimated_credits": 18, "total_length": 15.0, **picked}
+        return PRICED.get(path if method == "GET" else f"{method} {path}", {})
+    backend.request.side_effect = respond
+    create = server._tool_manager._tools["create_video"].fn
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        token = asyncio.run(create("city at night", 15))["preview_token"]
+        picked["format"] = "timelapse"  # the engine's Auto choice moved between preview and yes
+        with pytest.raises(ToolError, match="preview_changed"):
+            asyncio.run(create("city at night", 15, preview_token=token, confirm=True))
+        assert not [c for c in backend.request.await_args_list if c.args[0] == "POST"]
+        picked["format"] = "drone"
+        asyncio.run(create("city at night", 15, preview_token=token, confirm=True))
+    finally:
+        _principal.reset(context)
+    body = next(c for c in backend.request.await_args_list if c.args[0] == "POST").kwargs["body"]
+    assert body["format"] == "drone" and body["total_length"] == 15 and isinstance(body["total_length"], int)
+
+
+@pytest.mark.parametrize(("status", "cost", "fragment"), [
+    ("paused", 0, "Resuming is free"), ("failed", 18, "costs 18 credits. You have 120"),
+])
+def test_retry_video_previews_the_real_cost_then_retries(status, cost, fragment):
+    server, backend = _registered_tools()
+    job = {"id": str(UUID(int=7)), "status": status, "title": "Marble race", "credits_cost": 18}
+    backend.request.side_effect = _routes({**PRICED, f"/api/jobs/{job['id']}": job, f"POST /api/jobs/{job['id']}/retry": {"status": "queued"}})
+    retry = server._tool_manager._tools["retry_video"].fn
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        preview = asyncio.run(retry(job["id"]))
+        done = asyncio.run(retry(job["id"], preview_token=preview["preview_token"], confirm=True))
+    finally:
+        _principal.reset(context)
+    assert preview["status"] == "needs_approval" and preview["credits"] == cost and fragment in preview["summary"]
+    assert done["status_label"] == "In line"
+    assert [c.args[1] for c in backend.request.await_args_list if c.args[0] == "POST"] == [f"/api/jobs/{job['id']}/retry"]
+
+
+def test_retry_video_refuses_a_video_that_is_ready():
+    server, backend = _registered_tools()
+    job = {"id": str(UUID(int=7)), "status": "ready", "credits_cost": 18}
+    backend.request.side_effect = _routes({**PRICED, f"/api/jobs/{job['id']}": job})
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        with pytest.raises(ToolError, match="nothing to try again.*wrong_state"):
+            asyncio.run(server._tool_manager._tools["retry_video"].fn(job["id"]))
+    finally:
+        _principal.reset(context)
 
 
 def test_adjustments_name_what_the_engine_changed():
@@ -240,7 +297,7 @@ def test_create_series_previews_weekly_cost_then_forwards_the_confirmed_schedule
     context = _principal.set(TEST_PRINCIPAL)
     try:
         preview = asyncio.run(tool.fn(*args))
-        result = asyncio.run(tool.fn(*args, confirm=True))
+        result = asyncio.run(tool.fn(*args, preview_token=preview["preview_token"], confirm=True))
     finally:
         _principal.reset(context)
 
@@ -300,7 +357,7 @@ def test_workflow_prompts_require_preview_and_confirmation():
     series_text = series_prompt.fn()[0]["content"]["text"]
     publish_text = publish_prompt.fn("the marble one")[0]["content"]["text"]
 
-    assert "expected_credits" in create_text
+    assert "preview_token" in create_text
     assert "confirm=true" in create_text
     assert "never request passwords or tokens" in publish_text
     assert "queued, not that it has already been uploaded" in publish_text
@@ -366,11 +423,11 @@ def test_backend_sentences_reach_the_model_with_a_next_step():
     credits = str(_common._backend_error(BackendAPIError(402, "Not enough credits: this video needs 40, you have 12.")))
     assert "needs 40, you have 12" in credits and "get_credits" in credits
     timezone = str(_common._backend_error(BackendAPIError(422, "Unknown timezone: 'PST'.")))
-    assert timezone == "Unknown timezone: 'PST'."
+    assert timezone == "Unknown timezone: 'PST'. [code: invalid_input]"
     # 403 here means a route the connector may not use, not a user permission problem.
     assert "website" in str(_common._backend_error(BackendAPIError(403, "MCP access is not allowed")))
     # A write that timed out may have happened, so the model must check before retrying.
-    assert "SAME" in str(_common._backend_error(BackendUnavailable(), write=True))
+    assert str(_common._backend_error(BackendUnavailable(), write=True)).endswith("[code: outcome_unknown]")
     # Product-written reasons stay readable; a video's engine error does not.
     shown = _common._public_result({"last_error": "Paused. Add credits to resume.", "error": "engine trace"})
     assert shown["last_error"] == "Paused. Add credits to resume." and "engine" not in shown["error"]
@@ -415,25 +472,35 @@ def test_series_list_running_first_and_ended_series_count_as_stopped():
 
 def test_publish_refuses_repeat_posts_and_accounts_that_need_reconnecting():
     from shortsmaker_mcp.tools import publishing
-    yt, tt = str(UUID(int=1)), str(UUID(int=2))
+    yt, tt, ig = str(UUID(int=1)), str(UUID(int=2)), str(UUID(int=3))
+    health = {"worker_alive": True, "worker_platforms": ["youtube", "tiktok"]}
     backend = Mock()
     backend.bridge_token.return_value = "bridge-token"
     backend.request = AsyncMock(side_effect=lambda method, path, token, **kw: {
         "/api/connections": [
             {"id": yt, "platform": "youtube", "account_name": "MyChannel", "status": "active"},
             {"id": tt, "platform": "tiktok", "account_name": "me", "status": "error"},
+            {"id": ig, "platform": "instagram", "account_name": "pics", "status": "active"},
         ],
-        "/api/posts": [{"connection_id": yt, "status": "published"}],
+        "/api/posts": [{"connection_id": yt, "status": "published", "platform_post_url": "u"}],
+        "/api/publishing/health": health,
     }[path])
     check = publishing._check_destinations
     context = _principal.set(TEST_PRINCIPAL)
     try:
-        with pytest.raises(ToolError, match=r"me \(TikTok\) needs reconnecting"):
+        with pytest.raises(ToolError, match=r"me \(TikTok\) needs reconnecting.*needs_reconnect"):
             asyncio.run(check(backend, "9", {tt}, False))
-        with pytest.raises(ToolError, match=r"MyChannel \(YouTube\): posted"):
+        with pytest.raises(ToolError, match=r"MyChannel \(YouTube\): live.*already_posted"):
             asyncio.run(check(backend, "9", {yt}, False))
+        # Connected, but posting doesn't reach Instagram: refused, not queued forever.
+        with pytest.raises(ToolError, match=r"Instagram isn't supported yet.*platform_unavailable"):
+            asyncio.run(check(backend, "9", {ig}, True))
         # The user asked to repost.
-        assert asyncio.run(check(backend, "9", {yt}, True)) == {yt: "MyChannel (YouTube)"}
+        assert asyncio.run(check(backend, "9", {yt}, True)) == ({yt: "MyChannel (YouTube)"}, "")
+        # Posting is down: allowed, with a warning.
+        health["worker_alive"] = False
+        names, delayed = asyncio.run(check(backend, "9", {yt}, True))
+        assert delayed == publishing._DELAYED
     finally:
         _principal.reset(context)
 
@@ -519,7 +586,24 @@ def test_raw_backend_messages_become_plain_sentences():
     error = _common._backend_error(
         _common.BackendAPIError(503, "We can't price this video right now."), write=True, spends=True
     )
-    assert str(error) == _common._ENGINE_TROUBLE + " No credits were used."
+    assert str(error) == _common._ENGINE_TROUBLE + " No credits were used. Try again in a few minutes. [code: service_busy]"
+
+
+@pytest.mark.parametrize(("status", "code"), [
+    (400, "invalid_input"), (401, "connector_auth"), (402, "insufficient_credits"),
+    (403, "not_available_here"), (404, "not_found"), (409, "wrong_state"), (422, "invalid_input"),
+    (429, "rate_limited"), (500, "server_error"), (503, "service_busy"),
+])
+def test_every_backend_error_carries_a_code(status, code):
+    assert str(_common._backend_error(_common.BackendAPIError(status, "x"))).endswith(f"[code: {code}]")
+
+
+def test_errors_keep_the_wait_and_the_support_reference():
+    busy = _common._backend_error(_common.BackendAPIError(429, "slow down", retry_after=30))
+    assert "about 30 seconds" in str(busy) and "loop" in str(busy)
+    crash = _common._backend_error(_common.BackendAPIError(500, "Something went wrong on our side. Reference ab12-cd"))
+    assert "reference: ab12-cd" in str(crash) and "[code: server_error]" in str(crash)
+    assert str(_common._backend_error(ValueError())).endswith("[code: unexpected]")
 
 
 def test_failed_video_has_no_link_and_list_row_is_slim():
@@ -536,8 +620,56 @@ def test_failed_video_has_no_link_and_list_row_is_slim():
 def test_post_without_platform_link_is_sent_not_verified():
     from shortsmaker_mcp.tools import publishing
 
-    assert publishing._post_row({"status": "published"})["status_label"] == "Sent, not verified"
-    assert publishing._post_row({"status": "published", "platform_post_url": "u"})["status_label"] == "Posted"
+    assert publishing._post_row({"status": "published"})["state"] == "sent"
+    assert publishing._post_row({"status": "published", "platform_post_url": "u"})["state"] == "published"
+
+
+def test_post_states_cover_every_backend_status():
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    state = lambda **post: _common._post_state(post, now)  # noqa: E731
+    assert state(status="scheduled", scheduled_at="2026-10-15T11:59:00Z")["state"] == "queued"
+    later = state(status="scheduled", scheduled_at="2026-10-17T12:00:00Z")
+    assert later["state"] == "scheduled" and later["status_label"] == "Goes out in 2 days"
+    retrying = state(status="scheduled", attempts=2, max_attempts=5, next_attempt_at="2026-10-15T12:10:00Z")
+    assert retrying == {"state": "queued", "status_label": "Trying again in 10 minutes",
+                        "tries": "2 of 5", "next_try": "in 10 minutes"}
+    assert state(status="publishing")["state"] == "publishing"
+    assert state(status="published")["status_label"] == "Sent, not confirmed live"
+    assert state(status="published", platform_post_url="u")["status_label"] == "Live"
+    assert state(status="canceled")["state"] == "cancelled"
+    failed = state(status="failed", last_error="Token expired, reconnect the account")
+    assert failed["state"] == "failed" and failed["fix"].startswith("Reconnect")
+    assert state(status="failed", last_error="Upload rejected")["fix"] == "Retry the post"
+    assert "credits" not in failed["status_label"]
+
+
+def test_connected_is_not_the_same_as_can_post():
+    from shortsmaker_mcp.tools import publishing
+    yt = {"platform": "youtube", "status": "active"}
+    assert publishing._posting(yt, {}) == ("ok", "Working")  # health unknown: assume fine
+    assert publishing._posting(yt, {"worker_alive": True, "worker_platforms": ["tiktok"]})[0] == "unsupported"
+    assert publishing._posting(yt, {"worker_alive": False})[0] == "delayed"
+    assert publishing._posting({**yt, "status": "error"}, {})[1] == "Reconnect first"
+    row = publishing._connection_row(yt, {"worker_alive": True, "worker_platforms": ["youtube"]})
+    assert row["status_label"] == "Connected" and row["can_post"] is True
+
+
+def test_series_slot_rows_show_video_posts_retries_and_the_fix():
+    now = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    retrying = workflows._slot_row({
+        "id": "s1", "status": "planned", "slot_at": "2026-10-15T20:00:00Z", "attempts": 1, "max_attempts": 3,
+        "last_error": "Retrying (1 of 3): engine busy", "next_attempt_at": "2026-10-15T12:30:00Z",
+    }, "UTC", now)
+    assert retrying["tries"] == "1 of 3" and retrying["next_try"] == "today 12:30 PM UTC" and "fix" not in retrying
+    posted = workflows._slot_row({
+        "id": "s2", "status": "promoted", "job_id": "j", "job_status": "succeeded",
+        "posts": [{"status": "failed", "platform": "youtube", "account_name": "Ocean TV", "last_error": "Token revoked"}],
+    }, "UTC", now)
+    assert posted["video"] == "Ready" and posted["posting"][0]["account"] == "Ocean TV (YouTube)"
+    assert posted["posting"][0]["state"] == "failed" and posted["fix"].startswith("Reconnect")
+    assert workflows._slot_row({"status": "failed"}, None, now)["fix"].startswith("Try it again")
+    assert workflows._slot_row({"status": "skipped", "last_error": "Not enough credits"}, None, now)["fix"].startswith("Add credits")
+    assert "fix" not in workflows._slot_row({"status": "skipped", "last_error": "Skipped by you"}, None, now)
 
 
 def test_schedule_line_reads_like_a_sentence():
@@ -607,6 +739,8 @@ def test_upcoming_videos_are_the_next_planned_ones_soonest_first_in_series_time(
             {"id": "b", "slot_at": "2030-01-02T14:30:00+00:00", "status": "planned", "title": "Moons", "prompt": "p2"},
             {"id": "x", "slot_at": "2030-01-01T10:00:00+00:00", "status": "skipped", "title": "Old"},
             {"id": "a", "slot_at": "2030-01-01T14:30:00+00:00", "status": "planned", "title": "Mars", "prompt": "p1"},
+            {"id": "f", "slot_at": "2029-12-31T14:30:00+00:00", "status": "failed", "title": "Comets",
+             "last_error": "Gave up after 3 tries"},
         ],
     })
     context = _principal.set(TEST_PRINCIPAL)
@@ -619,6 +753,9 @@ def test_upcoming_videos_are_the_next_planned_ones_soonest_first_in_series_time(
     slots_call = next(c for c in backend.request.await_args_list if c.args[1].endswith("/slots"))
     assert "from" in slots_call.kwargs["params"] and "status" not in slots_call.kwargs["params"]
     assert result["summary"].startswith('Next in "Space": Tue 1 Jan 8:00 PM IST: "Mars"')
+    # The same mock answers the last-week read: the failed one needs attention, with its fix.
+    assert [row["title"] for row in result["needs_attention"]] == ["Comets"]
+    assert '"Comets" (Try it again' in result["summary"] and "fix" in result["next_step"]
 
 
 def test_cancel_waits_for_the_video_to_stop_and_says_credits_are_back(monkeypatch):
@@ -666,5 +803,5 @@ def test_review_fixes_hold_at_the_edges():
     api_error = _common.BackendAPIError(409, "Reconnect it first")
     assert "credits" not in str(_common._backend_error(api_error, write=True, spends=False))
     assert str(_common._backend_error(api_error, write=True, spends=True)).endswith(
-        "No credits were used. Read the item (get_video, get_series or list_posts) and tell the user its status and last_error; don't retry blindly."
+        "No credits were used. Read the item (get_video, get_series or list_posts) and tell the user its status and last_error; don't retry blindly. [code: wrong_state]"
     )
