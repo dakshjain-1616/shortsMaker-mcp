@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
-from uuid import UUID
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -20,46 +19,112 @@ from ._common import (
     ConnectionId,
     JobId,
     PostId,
+    _account_refs,
     _api,
     _bounded_text,
     _clean_tags,
-    _dedupe_ids,
     _dict_result,
     _items,
+    _label,
     _optional_params,
     _require_confirmation,
+    _video_ref,
+    _when,
     _with_next,
 )
 
 
 async def _check_destinations(
-    backend: BackendClient, job_id: UUID, chosen: set[str], visibility: str | None, allow_repost: bool,
-) -> None:
-    """Catch the two mistakes a chat makes that the API accepts: a repeat post and a TikTok
-    post whose privacy nobody chose (TikTok requires the user to pick it)."""
+    backend: BackendClient, job_id: str, chosen: set[str], allow_repost: bool,
+) -> dict[str, str]:
+    """Catch the mistakes a chat makes that the API accepts: an account that needs reconnecting
+    and a repeat post. Returns the chosen accounts' display names."""
     connections = await _api(backend, "GET", "/api/connections")
-    names = {
-        c["id"]: f"{c.get('account_name')} ({c.get('platform')})"
-        for c in connections if isinstance(c, dict) and c.get("id") in chosen
-    } if isinstance(connections, list) else {}
-    if visibility is None and any(name.endswith("(tiktok)") for name in names.values()):
+    rows = {c["id"]: c for c in connections if isinstance(c, dict) and c.get("id") in chosen} \
+        if isinstance(connections, list) else {}
+    broken = [_account(c) for c in rows.values() if c.get("status") not in (None, "active")]
+    if broken:
         raise ToolError(
-            "Ask the user who can see the TikTok post: everyone (visibility=public) or only them "
-            "(visibility=private). TikTok requires their explicit choice."
+            f"{', '.join(broken)} needs reconnecting before posting. Nothing was posted. "
+            "Offer connect_account for that platform."
         )
+    names = {cid: _account(c) for cid, c in rows.items()}
     if allow_repost:
-        return
+        return names
     posts = await _api(backend, "GET", "/api/posts", params={"job_id": str(job_id), "summary": "true"})
     repeats = [
-        f"{names.get(p['connection_id'], p['connection_id'])}: {p['status']}"
+        f"{names.get(p['connection_id'], 'an account')}: {_label(p['status']).lower()}"
         for p in posts if isinstance(p, dict)
         and p.get("connection_id") in chosen and p.get("status") in {"scheduled", "publishing", "published"}
     ] if isinstance(posts, list) else []
     if repeats:
         raise ToolError(
-            "This video is already posted or queued there (" + "; ".join(repeats) + "). Tell the user; "
+            "This video is already posted or waiting to post there (" + "; ".join(repeats) + "). Tell the user; "
             "call again with allow_repost=true only if they want it posted again."
         )
+    return names
+
+
+def _post_time(when: datetime | None) -> str:
+    """The time as the user gave it (their own offset), plus how far away it is."""
+    if when is None:
+        return "right away"
+    clock = f"{when:%I:%M %p}".lstrip("0")
+    return f"on {when:%a} {when.day} {when:%b} at {clock} ({_when(when)})"
+
+
+_PLATFORM = {"youtube": "YouTube", "tiktok": "TikTok", "instagram": "Instagram"}
+
+
+def _account(c: dict[str, Any]) -> str:
+    platform = _PLATFORM.get(c.get("platform"), str(c.get("platform") or "account"))
+    return f"{c.get('account_name') or 'your account'} ({platform})"
+
+
+def _connection_row(c: Any) -> Any:
+    if not isinstance(c, dict):
+        return c
+    label = "Connected" if c.get("status") in (None, "active") else _label(c.get("status"))
+    return {**c, "status_label": label}
+
+
+def _connections_summary(connections: list[Any]) -> str:
+    rows = [c for c in connections if isinstance(c, dict)]
+    if not rows:
+        return "No social accounts are connected yet. Want a link to connect YouTube, TikTok or Instagram?"
+    ok = [_account(c) for c in rows if c.get("status") in (None, "active")]
+    broken = [_account(c) for c in rows if c.get("status") not in (None, "active")]
+    text = f"Connected: {', '.join(ok)}." if ok else ""
+    if broken:
+        text += f" {', '.join(broken)} needs reconnecting. Want a sign-in link?"
+    return text.strip()
+
+
+def _post_row(p: Any) -> Any:
+    if not isinstance(p, dict):
+        return p
+    status = p.get("status")
+    label = _label(status)
+    if status == "published" and not p.get("platform_post_url"):
+        label = "Sent, not verified"
+    when = ""
+    if status == "scheduled" and p.get("scheduled_at"):
+        when = "goes out " + _when(p["scheduled_at"])
+    elif status == "published" and p.get("published_at"):
+        when = "posted " + _when(p["published_at"])
+    return {**p, "status_label": label, **({"when": when} if when else {})}
+
+
+def _posts_summary(posts: list[Any]) -> str:
+    rows = [p for p in posts if isinstance(p, dict)]
+    if not rows:
+        return "Nothing has been posted or scheduled yet."
+    counts: dict[str, int] = {}
+    for p in rows:
+        counts[p["status_label"]] = counts.get(p["status_label"], 0) + 1
+    return f"{len(rows)} post{'' if len(rows) == 1 else 's'}: " + ", ".join(
+        f"{n} {label.lower()}" for label, n in counts.items()
+    ) + "."
 
 
 def _connections_next(connections: list[Any]) -> str | None:
@@ -90,7 +155,7 @@ def _posts_next(posts: list[Any]) -> str | None:
 
 def register(server: MCPServer, backend: BackendClient) -> None:
     @server.tool(
-        title="List connected social accounts",
+        title="See my connected accounts",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -104,7 +169,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         when there is nothing usable, a ``next_step``. Never includes provider tokens.
         """
         out = _items(await _api(backend, "GET", "/api/connections"))
-        return _items(out["items"], _connections_next(out["items"]))
+        rows = [_connection_row(c) for c in out["items"]]
+        return _items(rows, _connections_next(rows), _connections_summary(rows))
 
     @server.tool(
         title="List my posts",
@@ -116,7 +182,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             Literal["scheduled", "publishing", "published", "failed", "canceled"] | None,
             Field(description="Optional publishing status filter."),
         ] = None,
-        job_id: Annotated[UUID | None, Field(description="Optional video job filter.")] = None,
+        job_id: Annotated[str | None, Field(max_length=200, description="Only posts of this video: words from its title, or its id.")] = None,
         updated_since: Annotated[datetime | None, Field(description="Optional timezone-aware update cutoff.")] = None,
     ) -> dict[str, Any]:
         """Use when the user asks whether a video was posted, what is scheduled, or why a post failed.
@@ -128,13 +194,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: ``items`` (id, job_id, connection_id, platform, status, scheduled_at,
         last_error), ``count`` and a ``next_step`` when there are none or some failed.
         """
+        job_id = await _video_ref(backend, job_id) if job_id else None
         params = _optional_params(status=status, job_id=job_id, updated_since=updated_since)
         params["summary"] = "true"
         out = _items(await _api(backend, "GET", "/api/posts", params=params))
-        return _items(out["items"], _posts_next(out["items"]))
+        rows = [_post_row(p) for p in out["items"]]
+        return _items(rows, _posts_next(rows), _posts_summary(rows))
 
     @server.tool(
-        title="Check posting service",
+        title="Check posting is working",
         annotations=READ_ONLY,
         structured_output=True,
     )
@@ -173,10 +241,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             await _api(backend, "POST", f"/api/connections/{platform}/authorize"),
             "Not connected yet. Give the user the link (expires in ~10 minutes); when they say "
             "they are done, check with list_connections.",
+            f"Open this link to connect your {_PLATFORM[platform]} account (it works for about 10 "
+            "minutes), then tell me when you're done and I'll check it worked.",
         )
 
     @server.tool(
-        title="Disconnect social account",
+        title="Disconnect an account",
         annotations=WRITE,
         structured_output=True,
     )
@@ -192,8 +262,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Don't: use it to fix a broken account; connect_account repairs it in place.
         Returns: the backend's confirmation.
         """
+        connection_id = (await _account_refs(backend, [connection_id]))[0]
         _require_confirmation(confirm, "Social-account disconnect")
-        return _dict_result(await _api(backend, "DELETE", f"/api/connections/{connection_id}"))
+        result = _dict_result(await _api(backend, "DELETE", f"/api/connections/{connection_id}"))
+        held = result.get("canceled_posts")
+        result["summary"] = "Disconnected. Posts already published stay up" + (
+            f"; {held} waiting post{'' if held == 1 else 's'} cancelled." if held else "."
+        )
+        return result
 
     @server.tool(
         title="Post a video",
@@ -204,63 +280,83 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     async def publish_video(
         job_id: JobId,
         connection_ids: Annotated[
-            list[UUID],
-            Field(min_length=1, max_length=20, description="One or more owned connected-account UUIDs."),
+            list[str],
+            Field(min_length=1, max_length=20, description="Where to post: account names or platforms ('my YouTube'), or ids from list_connections."),
+        ],
+        visibility: Annotated[
+            Literal["public", "unlisted", "private"],
+            Field(description=(
+                "Who can see it; always ask the user. Offer public (recommended), unlisted or "
+                "private. TikTok treats unlisted and private as only me. Instagram posts are always public."
+            )),
         ],
         scheduled_at: Annotated[
             AwareDatetime | None,
-            Field(description="Optional timezone-aware publish time; omit to publish as soon as possible."),
+            Field(description="Optional publish time in the user's own timezone offset; omit to post right away."),
         ] = None,
         title: Annotated[str | None, Field(max_length=100, description="Optional published title, up to 100 characters.")] = None,
         description: Annotated[str | None, Field(max_length=10_000, description="Optional published description.")] = None,
         tags: Annotated[list[str] | None, Field(max_length=100, description="Optional published tags.")] = None,
-        visibility: Annotated[
-            Literal["public", "unlisted", "private"] | None,
-            Field(description=(
-                "Who can see it. YouTube: public, unlisted or private. TikTok: public, or "
-                "unlisted/private for only me; TikTok needs the user's explicit choice. "
-                "Instagram ignores it. Omitted means public."
-            )),
-        ] = None,
         allow_repost: Annotated[
             bool,
             Field(description="True only if the user explicitly wants this video posted again to an account it already went to."),
         ] = False,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
-        """Use when the user has approved posting a finished video to their connected accounts.
+        """Use when the user wants to post a finished video to their connected accounts. Call it
+        first without confirm to get a preview, then with confirm=true after the user says yes.
 
-        Do: check the video is ready (get_video); show the account names, platforms,
-        visibility, time (with timezone), title and description; get explicit approval. For
-        TikTok, ask who can see it. If a call timed out, check list_posts before calling again.
-        Don't: post an unfinished video, post to an account whose status is not active, guess
-        the timezone, or set allow_repost unless the user asked to post it again.
-        Returns: ``items`` (one post per account: id, status "scheduled"/"publishing" = queued,
-        NOT posted), ``count`` and ``next_step``.
-        Example: "post my cooking video to YouTube tomorrow 9am" -> list_videos(query="cooking"),
-        list_connections, ask their timezone if unknown, show "MyChannel (YouTube), public,
-        Tue 09:00 America/Chicago, title ...", then publish_video(job_id, [youtube_id],
-        scheduled_at="2026-10-15T09:00:00-05:00", confirm=true).
-        Example: the TikTok account shows status "error" -> don't post; offer connect_account("tiktok").
+        Do: ask who can see it (public recommended) and when (now, or a time in their timezone).
+        Show the preview's ``summary`` and get a yes. If a call timed out, check list_posts
+        before calling again.
+        Don't: guess the timezone, or set allow_repost unless the user asked to post it again.
+        Returns: without confirm, a preview (status "needs_approval"; it also refuses an
+        unfinished video or an account that needs reconnecting). With confirm, ``items`` (one
+        post per account, "Waiting to post" = queued, NOT posted yet) and ``summary``.
+        Example: "post the cooking video to my YouTube tomorrow 9am" -> ask their timezone and
+        visibility, publish_video("cooking", ["my YouTube"], "public",
+        scheduled_at="2026-10-16T09:00:00-05:00") for the preview, then the same with confirm=true.
         """
+        job_id = await _video_ref(backend, job_id)
         if scheduled_at is not None and scheduled_at < datetime.now(UTC) - timedelta(minutes=1):
-            raise ToolError("scheduled_at is in the past. Ask for a future time, or omit it to post now.")
+            raise ToolError("That time is in the past. Ask for a future time, or post right away.")
         body = _optional_params(
             job_id=job_id,
-            connection_ids=_dedupe_ids(connection_ids),
+            connection_ids=await _account_refs(backend, connection_ids),
             scheduled_at=scheduled_at,
             title=_bounded_text(title, "title", 100),
             description=description.strip() if description is not None else None,
             tags=_clean_tags(tags),
             visibility=visibility,
         )
-        _require_confirmation(confirm, "Publishing")
-        await _check_destinations(backend, job_id, set(body["connection_ids"]), visibility, allow_repost)
+        if not confirm:
+            job = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
+            if job.get("status") in ("failed", "cancelled"):
+                raise ToolError("This video didn't finish, so there is nothing to post. Nothing was posted.")
+            if job.get("status") not in ("ready", "complete"):
+                raise ToolError(
+                    f"This video isn't ready to post yet ({_label(job.get('status')).lower()}). "
+                    "Nothing was posted; offer to post it once get_video shows it ready."
+                )
+            names = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
+            places = ", ".join(names.values()) or "the chosen accounts"
+            name = body.get("title") or job.get("title") or (job.get("niche") or "this video")[:60]
+            summary = f"Post \"{name}\" to {places} {_post_time(scheduled_at)}, {visibility}."
+            if any(place.endswith("(Instagram)") for place in names.values()) and visibility != "public":
+                summary += " Instagram posts are always public."
+            return {
+                "status": "needs_approval",
+                "summary": summary,
+                "next_step": "Show the summary and ask to post. On yes, call publish_video again with the same values and confirm=true.",
+            }
+        names = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
         result = await _api(backend, "POST", "/api/posts", body=body)
+        rows = [_post_row(p) for p in (result if isinstance(result, list) else [_dict_result(result)])]
         return _items(
-            result if isinstance(result, list) else [_dict_result(result)],
-            "Queued, not posted. Tell the user when it will go out; check list_posts(job_id=...) "
-            "when they ask.",
+            rows,
+            "Queued, not posted. Check list_posts(job_id=...) when the user asks.",
+            f"Queued to post to {', '.join(names.values()) or 'your accounts'} {_post_time(scheduled_at)}. "
+            "I'll confirm it's live when you ask.",
         )
 
     @server.tool(
@@ -286,4 +382,6 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             await _api(backend, "POST", f"/api/posts/{post_id}/{action}"),
             "Cancelled; it will not be posted." if action == "cancel"
             else "Queued again, not posted. Check list_posts when the user asks.",
+            "Cancelled. It won't be posted." if action == "cancel"
+            else "Trying that post again. I'll confirm it's live when you ask.",
         )

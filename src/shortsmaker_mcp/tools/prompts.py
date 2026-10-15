@@ -43,25 +43,25 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         )
         return _user_message(
             f"Help me make a Faceless Video Maker video {about}. {_ASKING} "
-            "First call get_video_options. Then ask, in order: the format (the 3-4 that fit the "
-            "topic best, plus Auto), the length (only lengths valid for that format), the sound "
-            "and, for narration, the voice and language, and the visual style (Auto by default). "
-            "Then resolve the estimated price with get_video_price and show me a short summary "
-            "with estimated_credits. Do not create anything until I approve. After I approve, "
-            "call create_video with confirm=true and a fresh idempotency_key, tell me it is "
-            "being made and takes a few minutes, and check it with get_video when I ask.\n"
+            "Keep it to two questions: the topic, then the quality (call get_video_options and "
+            "offer choices.quality, the first one recommended). Only ask about format, length, "
+            "sound, voice or style if I say I want to choose; otherwise leave them on auto. "
+            "Then call create_video without confirm to get the preview and show me its summary, "
+            "any adjustments and any warning, in plain words. Do not make anything until I say "
+            "yes. After I approve, call create_video again with the same settings, confirm=true "
+            "and expected_credits from the preview, tell me it is being made and takes a few "
+            "minutes, and check it with get_video when I ask.\n"
             "Handle these cases: if my topic is vague (\"make me a viral video\"), offer 3 concrete "
-            "topics first. If get_video_price says can_afford is false, show the price and my "
-            "balance and give me the billing link instead of asking to go ahead. "
-            "If create_video times out, retry with the SAME idempotency_key. If I ask for several "
-            "videos, quote the total first and use a new key for each.\n"
-            "Example summary before approval: \"30s Narrated Story about the Roman empire, "
-            "voice Atlas, 18 credits (you have 120). Make it?\""
+            "topics first. If the preview says I can't afford it, show the price, my balance and "
+            "the billing link instead of asking to go ahead. If the price changed, show the new "
+            "one and ask again. If I ask for several videos, preview each and say the total first.\n"
+            "Example summary before approval: \"A video about the Roman empire. This video costs "
+            "18 credits. You have 120, enough for about 6 like this. Make it?\""
         )
 
     @server.prompt(
         name="new_series",
-        title="Start an Autopilot series",
+        title="Start a series",
         description="Set up a series that makes and posts a new video on a schedule, step by step.",
     )
     def new_series(
@@ -70,24 +70,21 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         """Guide the assistant through creating an Autopilot series."""
         about = f"about {theme!r}" if theme else "and ask me what the series should be about first"
         return _user_message(
-            f"Help me start a Faceless Video Maker Autopilot series {about}. {_ASKING} "
-            "First call list_connections and get_video_options. If no social account is "
-            "connected, offer to connect one with connect_account and wait for me to finish in "
-            "the browser. Then ask, in order: the format, the posting days (Every day, Weekdays, "
-            "Weekends, or specific days), the posting times and my timezone, which connected "
-            "accounts to post to, the YouTube visibility, and when it should end (Never, 7 days, "
-            "15 days, 1 month). Quote the price per video with get_video_price and show a short "
-            "summary including how many videos a week it will make. Do not create anything until "
-            "I approve. After I approve, call create_series with confirm=true and tell me when "
-            "the first video is planned.\n"
+            f"Help me start a Faceless Video Maker series {about}. {_ASKING} "
+            "First call list_connections. If no social account is connected, offer to connect "
+            "one with connect_account and wait for me to finish in the browser. Then ask four "
+            "things, in order: what it is about, how often (Every day, Weekdays, Weekends, or "
+            "specific days), what time (and my timezone), and where to post. Then ask who can "
+            "see the posts: public (recommended), unlisted or private. Leave the video length "
+            "at 30 seconds and the rest on auto unless I want to choose. Call create_series "
+            "without confirm and show me its summary: the schedule, the weekly cost and how long "
+            "my credits last. Do not start anything until I approve. After I approve, call "
+            "create_series again with confirm=true and tell me when the first video is planned.\n"
             "Handle these cases: never assume my timezone, ask (offer my likely city's zone). For "
-            "\"every morning\", offer 07:00, 09:00 (recommended) or 11:00. Pass the video length "
-            "in job_defaults.total_length. If a TikTok account is chosen, ask whether posts are "
-            "public or only me.\n"
-            "Example summary before approval: \"Space facts, Mon-Fri at 09:00 and 18:00 "
-            "Europe/London, to MyChannel (YouTube, public), runs until stopped, 30s videos at about "
-            "18 credits each, 10 a week = 180 credits a week. Videos are made 6 hours before each "
-            "post. Start it?\""
+            "\"every morning\", offer 07:00, 09:00 (recommended) or 11:00.\n"
+            "Example summary before approval: \"Space facts: Weekdays at 9:00 AM BST, posts to "
+            "MyChannel (YouTube), public. About 18 credits a video, 5 a week = 90 credits a week. "
+            "Your 720 credits cover about 8 weeks. Start it?\""
         )
 
     @server.prompt(
@@ -98,30 +95,28 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     def share_video(job_id: JobId) -> list[dict[str, Any]]:
         """Guide the assistant through publishing a finished video."""
         return _user_message(
-            f"Help me post Faceless Video Maker video {job_id}. {_ASKING} First read the video and "
-            "list connected accounts. If the video is not complete, explain that it "
-            "cannot be published yet. If account authorization is needed, start "
-            "the browser flow and ask me to complete it; never request provider "
-            "tokens in chat. Before publishing, show the selected account names, "
-            "platforms, title, description, visibility, and schedule, then ask for "
-            "explicit confirmation. Only after approval call publish_video with "
-            "confirm=true. Report that the post is queued, not that it has already "
-            "been uploaded, and use list_posts to check final status."
+            f"Help me post my Faceless Video Maker video {job_id!r}. {_ASKING} Ask where to post "
+            "(my connected accounts from list_connections), who can see it (public recommended, "
+            "unlisted or private) and when (now, or a time in my timezone). If an account needs "
+            "reconnecting, start the browser flow with connect_account and ask me to finish it; "
+            "never request passwords or tokens in chat. Call publish_video without confirm and "
+            "show me its summary, then only after I approve call it again with confirm=true. Say "
+            "the post is queued, not that it has already been uploaded, and use list_posts to "
+            "check when I ask."
         )
 
     @server.prompt(
         name="review_series",
-        title="Review an Autopilot series",
+        title="Check on a series",
         description="See how a series is doing and change, pause, resume or stop it safely.",
     )
     def review_series(series_id: WorkflowId) -> list[dict[str, Any]]:
         """Guide the assistant through inspecting and changing a series."""
         return _user_message(
-            f"Help me manage Autopilot series {series_id}. First read the series "
-            "and its slots. Explain its status, schedule, destination accounts, "
-            "planned work, and any consequence of the requested change. For edits, "
-            "pause/resume/stop/delete, or slot actions, show the exact operation and "
-            "ask for explicit approval before calling the corresponding tool with "
-            "confirm=true. Do not claim a generated video or post exists until the "
-            "video or post readers confirm it."
+            f"Help me manage my series {series_id!r}. First read it with get_series and its "
+            "upcoming videos with list_series_slots. Explain in plain words how it is doing, "
+            "its schedule, where it posts and what is coming up, plus any consequence of the "
+            "change I ask for. For changes, pause, restart, end or delete, or changes to one "
+            "upcoming video, show me what will change and ask for my approval before calling "
+            "the tool with confirm=true. Do not say a video or post exists until a read confirms it."
         )

@@ -7,7 +7,7 @@ from typing import Any
 from mcp.server import MCPServer
 
 from ..backend_client import BackendClient
-from ._common import READ_ONLY, _api, _dict_result
+from ._common import READ_ONLY, _api, _dict_result, _when
 
 
 def register(server: MCPServer, backend: BackendClient) -> None:
@@ -23,7 +23,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Don't: offer to buy credits; this connector cannot buy credits or change billing.
         Returns: ``balance`` and recent credit status.
         """
-        return _dict_result(await _api(backend, "GET", "/api/payments/credit-status"))
+        result = _dict_result(await _api(backend, "GET", "/api/payments/credit-status"))
+        # The ledger's own wording ("Hold for job <id>") is internal; keep the numbers only.
+        result.pop("recent_transactions", None)
+        balance = result.get("balance")
+        if isinstance(balance, int | float):
+            summary = f"You have {balance:,} credits."
+            if result.get("low_balance"):
+                summary += " That's running low."
+            if result.get("subscription_expires"):
+                summary += f" Plan credits expire {_when(result['subscription_expires'])}."
+            result["summary"] = summary
+        return result
 
     @server.tool(
         title="Check my subscription",
@@ -53,7 +64,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         return _dict_result(await _api(backend, "GET", "/api/payments/plans"))
 
     @server.tool(
-        title="Get account features",
+        title="Check account features",
         annotations=READ_ONLY,
         structured_output=True,
     )

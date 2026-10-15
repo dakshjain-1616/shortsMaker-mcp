@@ -94,7 +94,8 @@ async def create_job(request: Request, user: str, body: dict):
     }
     JOBS[job_id] = job
     IDEMPOTENT[key] = job_id
-    return JSONResponse(job)
+    # The real API answers a new submit with just these three; a replayed key gets the whole row.
+    return JSONResponse({"id": job_id, "status": "queued", "credits_cost": JOB_COST})
 
 
 async def api(request: Request):
@@ -121,7 +122,10 @@ async def api(request: Request):
     if path == "/api/payments/credit-status":
         return JSONResponse({"balance": CREDITS[user]})
     if path == "/api/resolve":
-        return JSONResponse({"estimated_cost": 0.10, "estimated_credits": 10, "exact": True, "mode": "lite", "total_length": 12.0})
+        # Like the engine: lengths over 60s snap to 60, keeping what was asked in requested_length.
+        asked = float(request.query_params.get("total_length", 12))
+        return JSONResponse({"estimated_cost": 0.10, "estimated_credits": JOB_COST, "exact": True, "mode": "lite",
+                             "total_length": min(asked, 60.0), "requested_length": asked})
     if path == "/api/jobs" and request.method == "POST":
         return await create_job(request, user, body or {})
     if path == "/api/jobs" and request.method == "GET":

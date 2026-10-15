@@ -65,6 +65,12 @@
   /* Chips sit on images over a fixed dark scrim, so their dots keep the dark-theme colours. */
   .chip .dot.s-green { color: #4ade80; } .chip .dot.s-red { color: #f87171; } .chip .dot.s-blue { color: #60a5fa; }
   .chip .dot.s-yellow { color: #fbbf24; } .chip .dot.s-orange { color: #fb923c; } .chip .dot.s-muted { color: #8a8a8a; }
+  .upcoming { display: grid; gap: 8px; }
+  .slot { padding: 10px 12px; }
+  .slot .when { color: var(--accent); font-weight: 600; font-size: 12px; margin-bottom: 2px; }
+  :root[data-theme="light"] .slot .when { color: var(--text); }
+  .slot .idea { margin-top: 4px; color: var(--muted); font-size: 12px; display: -webkit-box;
+                -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   @media (prefers-reduced-motion: no-preference) { .bar span { transition: width .4s ease; } }
 </style>
 </head>
@@ -82,14 +88,13 @@
 "use strict";
 const APP_URL = "__APP_URL__";  // filled in by the server (MCP_APP_URL)
 let openTarget = APP_URL + "/dashboard";
-// Labels and colours match the web app (JobGrid.tsx, dashboard/workflows).
-const VIDEO_STATUS = {
-  pending: ["Pending", "s-muted"], processing: ["Generating", "s-blue"], paused: ["Paused", "s-orange"],
-  ready: ["Ready", "s-green"], complete: ["Complete", "s-green"], failed: ["Failed", "s-red"],
-  cancelled: ["Cancelled", "s-muted"], unknown: ["Unknown", "s-muted"],
+// Colours match the web app (JobGrid.tsx, dashboard/workflows); the words come from the server's
+// status_label so the gallery and the assistant say the same thing.
+const TONE = {
+  queued: "s-muted", pending: "s-muted", processing: "s-blue", paused: "s-orange", ready: "s-green",
+  complete: "s-green", failed: "s-red", cancelled: "s-muted", active: "s-green", stopped: "s-muted",
 };
-const SERIES_STATUS = { active: ["Running", "s-green"], paused: ["Paused", "s-yellow"], stopped: ["Stopped", "s-muted"] };
-const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const SERIES_TONE = { paused: "s-yellow" };
 
 // ---- Host bridge: MCP Apps JSON-RPC over postMessage ----
 let nextId = 1;
@@ -153,11 +158,14 @@ function chip(label, tone) {
 }
 function thumbnail(video) {
   const thumbs = video.thumbnail_urls || {};
-  return thumbs.after || thumbs.mid || thumbs.before || null;
+  return video.thumbnail || thumbs.after || thumbs.mid || thumbs.before || null;
 }
+function inProgress(video) { return ["queued", "pending", "processing"].includes(video.status); }
 
 function videoCard(video) {
-  const [label, tone] = VIDEO_STATUS[video.status] || VIDEO_STATUS.unknown;
+  // The chip is small, so a failed video says the short half there and the rest on the card.
+  const label = video.status === "failed" ? "Didn't work" : (video.status_label || video.status || "Unknown");
+  const tone = TONE[video.status] || "s-muted";
   const name = video.title || video.niche || "Untitled video";
   const card = el("article", "card");
   const playable = Boolean(video.video_url);
@@ -170,10 +178,11 @@ function videoCard(video) {
     img.onerror = () => img.remove();
     frame.append(img);
   } else {
-    frame.append(el("div", "placeholder", video.status === "processing" || video.status === "pending" ? (video.active_stage || "Being made…") : ""));
+    const note = inProgress(video) ? (video.active_stage || "Being made…") : video.status === "failed" ? "Didn't finish. Credits returned." : "";
+    frame.append(el("div", "placeholder", note));
   }
   frame.append(chip(label, tone));
-  if (video.status === "processing" || video.status === "pending") {
+  if (inProgress(video)) {
     const bar = el("div", "bar"), fill = el("span");
     fill.style.width = Math.max(3, Math.min(100, Number(video.progress_pct) || 0)) + "%";
     bar.append(fill); frame.append(bar);
@@ -190,24 +199,16 @@ function videoCard(video) {
   }
   const meta = el("div", "meta");
   meta.append(el("div", "title", name));
-  const sub = [video.format ? video.format.replace(/_/g, " ") : "", when(video.created_at)].filter(Boolean).join(" · ");
+  // Format ids ("process") are internal names, so the card shows only when it was made.
+  const sub = video.created || when(video.created_at);
   if (sub) meta.append(el("div", "sub", sub));
   card.append(frame, meta);
   return card;
 }
 
-function schedule(series) {
-  const days = (series.days_of_week || []).slice().sort();
-  let dayText = days.map((d) => DAYS[d]).join(", ");
-  if (days.length === 7) dayText = "Every day";
-  else if (days.join() === "0,1,2,3,4") dayText = "Weekdays";
-  else if (days.join() === "5,6") dayText = "Weekends";
-  const times = (series.times_of_day || []).join(", ");
-  return [dayText, times].filter(Boolean).join(" at ");
-}
-
 function seriesCard(series) {
-  const [label, tone] = SERIES_STATUS[series.status] || SERIES_STATUS.stopped;
+  const label = series.status_label || series.status || "Stopped";
+  const tone = SERIES_TONE[series.status] || TONE[series.status] || "s-muted";
   const card = el("button", "card link");
   card.type = "button";
   card.setAttribute("aria-label", "Open " + (series.name || "series") + " in Faceless Video Maker");
@@ -216,9 +217,8 @@ function seriesCard(series) {
   const head = el("div", "row");
   head.append(el("span", "dot " + tone), el("span", "sub " + tone, label));
   meta.append(head, el("div", "title", series.name || series.theme || "Untitled series"));
-  const plan = schedule(series);
-  if (plan) meta.append(el("div", "sub", plan + (series.timezone ? " (" + series.timezone + ")" : "")));
-  if (series.status === "active" && series.next_slot_at) meta.append(el("div", "sub", "Next video " + when(series.next_slot_at)));
+  if (series.schedule) meta.append(el("div", "sub", series.schedule));
+  if (series.next_video) meta.append(el("div", "sub", "Next video " + series.next_video));
   if (series.last_error) meta.append(el("div", "sub reason " + tone, series.last_error));
   const counts = series.counts || {};
   const stats = el("div", "stats");
@@ -236,6 +236,21 @@ function render(data) {
   foot.hidden = true;
   if (!data) { root.append(el("div", "empty", "Nothing to show.")); return; }
 
+  if (Array.isArray(data.items) && data.series_name) {
+    // Upcoming videos of one series: when, title and idea, so the user can review before they are made.
+    openTarget = APP_URL + "/dashboard/workflows";
+    const list = el("div", "upcoming");
+    data.items.forEach((slot) => {
+      const row = el("article", "card slot");
+      row.append(el("div", "when", slot.when || ""), el("div", "title", slot.title || "Idea not written yet"));
+      if (slot.prompt) row.append(el("div", "idea", slot.prompt));
+      if (slot.last_error) row.append(el("div", "idea s-red", slot.last_error));
+      list.append(row);
+    });
+    root.append(data.items.length ? list : el("div", "empty", "Nothing upcoming in " + data.series_name + " right now."));
+    return;
+  }
+
   if (Array.isArray(data.series)) {
     openTarget = APP_URL + "/dashboard/workflows";
     const grid = el("div", "grid series");
@@ -250,9 +265,9 @@ function render(data) {
   const grid = el("div", "grid");
   videos.forEach((v) => grid.append(videoCard(v)));
   root.append(videos.length ? grid : el("div", "empty", "No videos here yet. Ask me to make one."));
-  const hidden = Object.entries(data.hidden || {}).filter(([, n]) => n).map(([status, n]) => n + " " + status);
+  const hiddenCount = Object.values(data.hidden || {}).reduce((a, n) => a + (Number(n) || 0), 0);
   const notes = [];
-  if (hidden.length) notes.push(hidden.join(", ") + " hidden");
+  if (hiddenCount) notes.push(hiddenCount + " that didn't finish or were cancelled are hidden");
   if (data.next_offset != null) notes.push("more available");
   if (notes.length) { foot.textContent = notes.join(" · "); foot.hidden = false; }
 }
