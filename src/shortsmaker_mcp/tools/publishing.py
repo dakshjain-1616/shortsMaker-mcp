@@ -20,8 +20,10 @@ from ._common import (
     ConnectionId,
     JobId,
     PostId,
+    PreviewToken,
     _account_refs,
     _api,
+    _approval,
     _bounded_text,
     _clean_tags,
     _dict_result,
@@ -30,7 +32,6 @@ from ._common import (
     _label,
     _optional_params,
     _post_state,
-    _require_confirmation,
     _video_ref,
     _when,
     _with_next,
@@ -38,27 +39,29 @@ from ._common import (
 
 
 async def _health(backend: BackendClient) -> dict[str, Any]:
-    """Whether posting works right now; {} (unknown, assume fine) if it can't be read, since
-    a diagnostic must never block listing accounts or posting."""
+    """Whether posting works right now; unknown health is not proof of availability."""
     try:
         return _dict_result(await _api(backend, "GET", "/api/publishing/health"))
     except ToolError:
         return {}
 
 
-_DELAYED = "Posting is paused on our side; posts wait and go out when it's back"
+_DELAYED = "Publishing is unavailable right now; try again when the worker is healthy"
 
 
 def _posting(c: dict[str, Any], health: dict[str, Any]) -> tuple[str, str]:
     """Can this account be posted to right now, apart from being connected? (reason, words);
-    reason is ok, reconnect, unsupported or delayed."""
+    reason is ok, reconnect or unavailable."""
     if c.get("status") not in (None, "active"):
         return "reconnect", "Reconnect first"
-    platforms = health.get("worker_platforms")
-    if isinstance(platforms, list) and health.get("worker_alive") and c.get("platform") not in platforms:
-        return "unsupported", f"Posting to {_PLATFORM.get(c.get('platform'), c.get('platform'))} isn't supported yet"
-    if health.get("worker_alive") is False:
-        return "delayed", _DELAYED
+    if health.get("worker_alive") is not True:
+        return "unavailable", _DELAYED
+    platforms = health.get("operational_platforms", health.get("worker_platforms"))
+    if not isinstance(platforms, list):
+        return "unavailable", "Publishing capability is unknown; try again after checking publishing health"
+    if c.get("platform") not in platforms:
+        platform = _PLATFORM.get(c.get("platform"), c.get("platform"))
+        return "unavailable", f"Posting to {platform} is unavailable on the running publisher"
     return "ok", "Working"
 
 
@@ -66,11 +69,13 @@ async def _check_destinations(
     backend: BackendClient, job_id: str, chosen: set[str], allow_repost: bool,
 ) -> tuple[dict[str, str], str]:
     """Catch the mistakes a chat makes that the API accepts: an account that needs reconnecting,
-    a platform posting doesn't support, and a repeat post. Returns the chosen accounts' display
-    names and a warning ("" if none) when posting is delayed."""
+    a platform posting doesn't support, and a repeat post. Returns chosen account names."""
     connections, health = await asyncio.gather(_api(backend, "GET", "/api/connections"), _health(backend))
     rows = {c["id"]: c for c in connections if isinstance(c, dict) and c.get("id") in chosen} \
         if isinstance(connections, list) else {}
+    missing = chosen - rows.keys()
+    if missing:
+        raise _fail("not_found", "One or more selected accounts are no longer connected. Nothing was posted; list accounts and choose again.")
     broken = [_account(c) for c in rows.values() if c.get("status") not in (None, "active")]
     if broken:
         raise _fail(
@@ -79,11 +84,10 @@ async def _check_destinations(
             "Offer connect_account for that platform."
         )
     posting = {cid: _posting(c, health) for cid, c in rows.items()}
-    unsupported = [why for reason, why in posting.values() if reason == "unsupported"]
-    if unsupported:
-        # A post there would wait forever, so refuse instead of queueing it.
-        raise _fail("platform_unavailable", f"{'; '.join(unsupported)}. Nothing was posted.")
-    delayed = next((why for reason, why in posting.values() if reason == "delayed"), "")
+    unavailable = [why for reason, why in posting.values() if reason == "unavailable"]
+    if unavailable:
+        raise _fail("platform_unavailable", f"{'; '.join(unavailable)}. Nothing was posted.")
+    delayed = ""
     names = {cid: _account(c) for cid, c in rows.items()}
     if allow_repost:
         return names, delayed
@@ -170,6 +174,12 @@ def _connections_next(connections: list[Any]) -> str | None:
             f"Not usable now: {', '.join(broken)} (see status and last_error). Offer "
             "connect_account(platform) to reconnect; don't post or retry posts to them until fixed."
         )
+    unavailable = sorted({
+        str(c.get("platform")) for c in connections
+        if isinstance(c, dict) and not c.get("can_post")
+    })
+    if unavailable:
+        return f"Publishing is unavailable for {', '.join(unavailable)}. Check publishing health before posting or starting a series."
     return None
 
 
@@ -258,9 +268,19 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: whether the publishing worker is alive and processing the queue, which
         platforms it posts to, and a ``summary``.
         """
-        health = _dict_result(await _api(backend, "GET", "/api/publishing/health"))
-        if health.get("worker_alive") is False:
+        health, connections = await asyncio.gather(
+            _api(backend, "GET", "/api/publishing/health"),
+            _api(backend, "GET", "/api/connections"),
+        )
+        health = _dict_result(health)
+        accounts = [_connection_row(c, health) for c in _items(connections)["items"]]
+        health["accounts"] = accounts
+        if health.get("worker_alive") is not True:
             summary = "Posting is paused on our side right now. Waiting posts go out as soon as it's back."
+        elif not health.get("operational_platforms", health.get("worker_platforms")):
+            summary = "The publishing worker is running but reports no available platforms."
+        elif any(not c.get("can_post") for c in accounts):
+            summary = "The publishing worker is running, but posting is unavailable for some connected accounts."
         else:
             summary = "Posting is working."
         waiting = health.get("waiting")
@@ -276,6 +296,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     async def connect_account(
         platform: Annotated[Literal["youtube", "instagram", "tiktok"], Field(description="Provider to connect.")],
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants to connect (or reconnect) a YouTube, TikTok or Instagram
         account. Returns a sign-in link for the user to open in their browser.
@@ -286,10 +307,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Don't: ask for passwords or tokens in chat, or say the account is connected before
         list_connections shows it.
         Returns: the sign-in link and a ``next_step``.
-        Example: "connect my TikTok" -> connect_account("tiktok", confirm=true); reply "Open this
-        link and approve, then tell me when you're done", then call list_connections to check.
+        Example: "connect my TikTok" -> preview connect_account("tiktok"), show it, then
+        confirm with its preview_token; give the sign-in link and check list_connections later.
         """
-        _require_confirmation(confirm, f"Connecting a {platform} account")
+        approval = _approval({
+            "action": "connect_account", "platform": platform,
+            "side_effects": "Creates a short-lived sign-in link; the account connects only after provider approval.",
+            "reversible": True,
+        }, confirm, preview_token, "connect_account")
+        if approval:
+            return approval
         return _with_next(
             await _api(backend, "POST", f"/api/connections/{platform}/authorize"),
             "Not connected yet. Give the user the link (expires in ~10 minutes); when they say "
@@ -306,6 +333,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     async def disconnect_account(
         connection_id: ConnectionId,
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants to remove a connected social account.
 
@@ -316,7 +344,19 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: the backend's confirmation.
         """
         connection_id = (await _account_refs(backend, [connection_id]))[0]
-        _require_confirmation(confirm, "Social-account disconnect")
+        accounts = _items(await _api(backend, "GET", "/api/connections"))["items"]
+        account = next((c for c in accounts if c.get("id") == connection_id), None)
+        if account is None:
+            raise _fail("not_found", "That account is no longer connected. Nothing was disconnected.")
+        preview = {
+            "action": "disconnect_account", "account": _account(account),
+            "connection_id": connection_id,
+            "side_effects": "Cancels its queued posts and removes stored sign-in tokens; published posts stay up.",
+            "reversible": False,
+        }
+        approval = _approval(preview, confirm, preview_token, "disconnect_account")
+        if approval:
+            return approval
         result = _dict_result(await _api(backend, "DELETE", f"/api/connections/{connection_id}"))
         held = result.get("canceled_posts")
         result["summary"] = "Disconnected. Posts already published stay up" + (
@@ -355,17 +395,19 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             Field(description="True only if the user explicitly wants this video posted again to an account it already went to."),
         ] = False,
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants to post a finished video to their connected accounts. Call it
-        first without confirm to get a preview, then with confirm=true after the user says yes.
+        first without confirm to get a preview, then with confirm=true and its preview_token
+        after the user says yes.
 
         Do: ask who can see it (public recommended) and when (now, or a time in their timezone).
         Show the preview's ``summary`` and get a yes. If a call timed out, check list_posts
         before calling again.
         Don't: guess the timezone, or set allow_repost unless the user asked to post it again.
         Returns: without confirm, a preview (status "needs_approval"; it also refuses an
-        unfinished video, an account that needs reconnecting or a platform posting doesn't
-        support). With confirm, ``items`` (one post per account, state queued or scheduled:
+        unfinished video, an account that needs reconnecting or an unavailable platform).
+        With a matching preview_token and confirm, ``items`` (one post per account, state queued or scheduled:
         NOT posted yet) and ``summary``.
         Example: "post the cooking video to my YouTube tomorrow 9am" -> ask their timezone and
         visibility, publish_video("cooking", ["my YouTube"], "public",
@@ -383,30 +425,30 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             tags=_clean_tags(tags),
             visibility=visibility,
         )
-        if not confirm:
-            job = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
-            if job.get("status") in ("failed", "cancelled"):
-                raise _fail("wrong_state", "This video didn't finish, so there is nothing to post. Nothing was posted.")
-            if job.get("status") not in ("ready", "complete"):
-                raise _fail(
-                    "wrong_state",
-                    f"This video isn't ready to post yet ({_label(job.get('status')).lower()}). "
-                    "Nothing was posted; offer to post it once get_video shows it ready."
-                )
-            names, delayed = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
-            places = ", ".join(names.values()) or "the chosen accounts"
-            name = body.get("title") or job.get("title") or (job.get("niche") or "this video")[:60]
-            summary = f"Post \"{name}\" to {places} {_post_time(scheduled_at)}, {visibility}."
-            if any(place.endswith("(Instagram)") for place in names.values()) and visibility != "public":
-                summary += " Instagram posts are always public."
-            if delayed:
-                summary += f" Note: {delayed}."
-            return {
-                "status": "needs_approval",
-                "summary": summary,
-                "next_step": "Show the summary and ask to post. On yes, call publish_video again with the same values and confirm=true.",
-            }
+        job = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
+        if job.get("status") in ("failed", "cancelled"):
+            raise _fail("wrong_state", "This video didn't finish, so there is nothing to post. Nothing was posted.")
+        if job.get("status") not in ("ready", "complete"):
+            raise _fail("wrong_state", "This video isn't ready to post yet. Nothing was posted.")
+        # Pin generated metadata at preview time; a later edit changes the token, not the post.
+        body["title"] = (body.get("title") or job.get("title") or job.get("niche") or "Untitled")[:100]
+        body["description"] = body.get("description", job.get("description"))
+        body["tags"] = body.get("tags", job.get("tags") or [])
         names, _ = await _check_destinations(backend, job_id, set(body["connection_ids"]), allow_repost)
+        places = ", ".join(names.values())
+        name = body.get("title") or job.get("title") or (job.get("niche") or "this video")[:60]
+        summary = f"Post \"{name}\" to {places} {_post_time(scheduled_at)}, {visibility}."
+        if any(place.endswith("(Instagram)") for place in names.values()) and visibility != "public":
+            summary += " Instagram posts are always public."
+        preview = {
+            "action": "publish_video", "summary": summary, "job_id": job_id,
+            "accounts": names, "request": body, "allow_repost": allow_repost,
+            "side_effects": "Queues a public-platform upload; removal after publishing must happen on the platform.",
+            "reversible": False,
+        }
+        approval = _approval(preview, confirm, preview_token, "publish_video")
+        if approval:
+            return {**approval, "summary": summary}
         result = await _api(backend, "POST", "/api/posts", body=body)
         rows = [_post_row(p) for p in (result if isinstance(result, list) else [_dict_result(result)])]
         return _items(
@@ -425,16 +467,33 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         post_id: PostId,
         action: Annotated[Literal["cancel", "retry"], Field(description="Post action to perform.")],
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants to cancel a waiting post or retry a failed or cancelled one.
 
-        Do: read it with list_posts first; before a retry, show the destination and the
-        earlier last_error.
+        Do: read it with list_posts first; show the preview's destination and earlier
+        last_error, then confirm with its preview_token.
         Don't: retry a post whose account shows an error (reconnect with connect_account
         first), or try to cancel one already "publishing": it cannot be recalled.
         Returns: the post's new status plus ``next_step``.
         """
-        _require_confirmation(confirm, f"Publishing post {action}")
+        posts = _items(await _api(backend, "GET", "/api/posts"))["items"]
+        post = next((p for p in posts if str(p.get("id")) == str(post_id)), None)
+        if post is None:
+            raise _fail("not_found", "That post was not found. Nothing changed.")
+        allowed = {"cancel": {"scheduled"}, "retry": {"failed", "canceled"}}
+        if post.get("status") not in allowed[action]:
+            raise _fail("wrong_state", f"This post is {post.get('status')}; {action} is unavailable. Nothing changed.")
+        preview = {
+            "action": action, "post_id": str(post_id), "status": post.get("status"),
+            "account": _account(post), "scheduled_at": post.get("scheduled_at"),
+            "last_error": post.get("last_error"),
+            "side_effects": "Cancels a waiting upload" if action == "cancel" else "Queues another upload attempt",
+            "reversible": action == "cancel",
+        }
+        approval = _approval(preview, confirm, preview_token, "control_post")
+        if approval:
+            return approval
         return _with_next(
             await _api(backend, "POST", f"/api/posts/{post_id}/{action}"),
             "Cancelled; it will not be posted." if action == "cancel"

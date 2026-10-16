@@ -220,7 +220,10 @@ function seriesCard(series) {
   head.append(el("span", "dot " + tone), el("span", "sub " + tone, label));
   meta.append(head, el("div", "title", series.name || series.theme || "Untitled series"));
   if (series.schedule) meta.append(el("div", "sub", series.schedule));
+  if (series.health_state) meta.append(el("div", "sub " + (series.health_state === "blocked" ? "s-red" : "s-orange"),
+    "Health: " + series.health_state + (series.health_reason ? " — " + series.health_reason : "")));
   if (series.next_video) meta.append(el("div", "sub", "Next video " + series.next_video));
+  if (series.next_action && series.health_state === "blocked") meta.append(el("div", "sub s-orange", series.next_action));
   if (series.last_error) meta.append(el("div", "sub reason " + tone, series.last_error));
   const counts = series.counts || {};
   const stats = el("div", "stats");

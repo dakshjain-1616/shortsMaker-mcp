@@ -74,7 +74,7 @@ def test_list_connections_points_to_connect_when_empty_or_broken():
     assert broken["count"] == 2 and "tiktok" in broken["next_step"] and "youtube" not in broken["next_step"]
 
     backend.request.return_value = [{"id": "a", "platform": "youtube", "status": "active"}]
-    assert "next_step" not in _run(registered["list_connections"].fn())
+    assert "publishing" in _run(registered["list_connections"].fn())["next_step"].lower()
 
 
 def test_list_posts_flags_failures():
@@ -135,8 +135,32 @@ def test_create_video_refuses_a_resolution_the_format_does_not_offer():
 )
 def test_confirmed_writes_hit_the_route_and_say_what_happens_next(name, args, method, path, next_word):
     registered, backend = _server()
-    backend.request.return_value = {"ok": True}
-    result = _run(registered[name].fn(*args, confirm=True))
+    async def respond(verb, route, token, **kw):
+        if verb == "GET" and route == "/api/posts":
+            return [{"id": str(ID), "status": "failed" if args[1] == "retry" else "scheduled",
+                     "connection_id": str(ID)}]
+        if verb == "GET" and route == "/api/connections":
+            return [{"id": str(ID), "platform": "tiktok", "status": "active"}]
+        if verb == "GET" and route == "/api/workflows":
+            return [{"id": str(ID), "name": "Series"}]
+        if verb == "GET" and route == f"/api/workflows/{ID}/slots":
+            return [{"id": str(ID), "workflow_id": str(ID), "title": "Idea",
+                     "status": "failed" if args[1] == "retry" else "planned"}]
+        if verb == "GET" and route.startswith("/api/workflows/"):
+            return {"id": str(ID), "name": "Series", "status": "active",
+                        "job_defaults": {"mode": "lite", "format": "auto", "total_length": 15,
+                                         "resolution": "720p"}}
+        if verb == "GET" and route == "/api/config":
+            return {"resolutions": ["720p", "1080p"]}
+        if verb == "GET" and route == "/api/resolve":
+            return {"estimated_credits": 18}
+        if verb == "GET" and route.startswith("/api/jobs/"):
+            return {"id": str(ID), "title": "Video", "status": "queued"}
+        return {"ok": True, "name": "Series", "status": "paused", "title": "Idea"}
+    backend.request.side_effect = respond
+    preview = _run(registered[name].fn(*args))
+    assert preview["status"] == "needs_approval"
+    result = _run(registered[name].fn(*args, preview_token=preview["preview_token"], confirm=True))
     writes = [c.args[:2] for c in backend.request.await_args_list if c.args[0] != "GET"]
     assert writes == [(method, path)]  # reads around the write are fine; exactly one write
     assert next_word in result["next_step"]
@@ -155,11 +179,26 @@ def test_slot_and_metadata_writes_refuse_empty_or_misplaced_fields():
 
 def test_disconnect_and_slot_update_forward_confirmed_values():
     registered, backend = _server()
-    backend.request.return_value = {"ok": True}
-    _run(registered["disconnect_account"].fn(ID, confirm=True))
+    async def respond(verb, route, token, **kw):
+        if verb == "GET" and route == "/api/connections":
+            return [{"id": str(ID), "platform": "youtube", "account_name": "Channel", "status": "active"}]
+        if verb == "GET" and route == "/api/workflows":
+            return [{"id": str(ID), "name": "Series"}]
+        if verb == "GET" and route == f"/api/workflows/{ID}/slots":
+            return [{"id": str(ID), "title": "Old idea", "status": "planned"}]
+        if verb == "GET" and route.startswith("/api/jobs/"):
+            return {"id": str(ID), "title": "Video", "status": "ready"}
+        return {"ok": True}
+    backend.request.side_effect = respond
+    preview = _run(registered["disconnect_account"].fn(ID))
+    _run(registered["disconnect_account"].fn(ID, preview_token=preview["preview_token"], confirm=True))
     assert backend.request.await_args.args[:2] == ("DELETE", f"/api/connections/{ID}")
-    _run(registered["update_series_slot"].fn(ID, title=" New idea ", confirm=True))
+    preview = _run(registered["update_series_slot"].fn(ID, title=" New idea "))
+    _run(registered["update_series_slot"].fn(ID, title=" New idea ",
+                                             preview_token=preview["preview_token"], confirm=True))
     assert backend.request.await_args.args[:2] == ("PATCH", f"/api/workflow-slots/{ID}")
     assert backend.request.await_args.kwargs["body"] == {"title": "New idea"}
-    _run(registered["update_video_details"].fn(ID, tags=[" a "], visibility="unlisted", confirm=True))
+    preview = _run(registered["update_video_details"].fn(ID, tags=[" a "], visibility="unlisted"))
+    _run(registered["update_video_details"].fn(ID, tags=[" a "], visibility="unlisted",
+                                              preview_token=preview["preview_token"], confirm=True))
     assert backend.request.await_args.kwargs["body"] == {"tags": ["a"], "visibility": "unlisted"}

@@ -84,7 +84,7 @@ async def create_job(request: Request, user: str, body: dict):
     job = {
         "id": job_id,
         # The real API reports queued jobs as "pending"; a "failed-" niche stands in for a failure.
-        "status": "failed" if niche.startswith("failed-") else "pending",
+        "status": "failed" if niche.startswith("failed-") else "ready" if niche.startswith("ready-") else "pending",
         "created_at": f"2026-10-01T00:00:{len(JOBS):02d}+00:00",
         "niche": niche,
         "format": body.get("format"),
@@ -121,10 +121,48 @@ async def api(request: Request):
         return JSONResponse({"promo_end_card": False})
     if path == "/api/payments/credit-status":
         return JSONResponse({"balance": CREDITS[user]})
+    if path == "/api/publishing/health":
+        return JSONResponse({"worker_alive": True, "worker_platforms": ["youtube"], "scheduler_alive": True})
+    if path == "/api/config" and request.method == "GET":
+        return JSONResponse({
+            "formats": [{"id": value, "label": value} for value in ("auto", "transformation", "asmr")],
+            "modes": [{"id": "lite", "label": "Standard"}],
+            "resolutions": ["720p", "1080p"],
+            "resolutions_by_format": {
+                "transformation": {"available": ["720p", "1080p"], "default": "720p"},
+                "asmr": {"available": ["1080p"], "default": "1080p"},
+            },
+            "styles": [],
+            "styles_by_format": {"transformation": {"available": []}, "asmr": {"available": []}},
+            "audio": {"modes": [], "by_format": {}, "voices": [], "music_tracks": []},
+        })
+    if path == "/api/connections" and request.method == "GET":
+        return JSONResponse([{"id": "00000000-0000-0000-0000-000000000001", "platform": "youtube",
+                              "account_name": "Test channel", "status": "active"}])
+    if path == "/api/posts" and request.method == "GET":
+        return JSONResponse([{"id": "00000000-0000-0000-0000-000000000001", "status": "scheduled",
+                              "platform": "youtube", "account_name": "Test channel"}])
+    if path == "/api/workflows" and request.method == "GET":
+        return JSONResponse([{"id": "00000000-0000-0000-0000-000000000001", "name": "Test series",
+                              "theme": "Test theme", "status": "active", "timezone": "UTC"}])
+    if path == "/api/workflows/00000000-0000-0000-0000-000000000001/slots" and request.method == "GET":
+        return JSONResponse([{"id": "00000000-0000-0000-0000-000000000001",
+                              "workflow_id": "00000000-0000-0000-0000-000000000001",
+                              "title": "Test idea", "status": "planned"}])
+    if path.startswith("/api/posts/") and path.count("/") == 3 and request.method == "GET":
+        return JSONResponse({"id": path.rsplit("/", 1)[1], "status": "scheduled",
+                             "platform": "youtube", "account_name": "Test channel"})
     if path == "/api/resolve":
         # Like the engine: lengths over 60s snap to 60, keeping what was asked in requested_length.
         asked = float(request.query_params.get("total_length", 12))
-        return JSONResponse({"estimated_cost": 0.10, "estimated_credits": JOB_COST, "exact": True, "mode": "lite",
+        niche = request.query_params.get("niche", "")
+        requested_format = request.query_params.get("format", "transformation")
+        resolution = request.query_params.get("resolution", "720p")
+        resolved_format = "asmr" if "marble rolling through a neon obstacle course" in niche.lower() else requested_format
+        if resolved_format == "asmr" and resolution != "1080p":
+            return JSONResponse({"detail": "This format doesn't offer resolution '720p'; it offers 1080p."}, status_code=422)
+        return JSONResponse({"format": resolved_format, "resolution": resolution,
+                             "estimated_cost": 0.10, "estimated_credits": JOB_COST, "exact": True, "mode": "lite",
                              "total_length": min(asked, 60.0), "requested_length": asked})
     if path == "/api/jobs" and request.method == "POST":
         return await create_job(request, user, body or {})

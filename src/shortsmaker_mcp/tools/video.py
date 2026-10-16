@@ -25,16 +25,15 @@ from ._common import (
     Niche,
     PreviewToken,
     _api,
+    _approval,
     _bounded_text,
-    _check_token,
     _clean_tags,
     _dict_result,
     _fail,
     _label,
     _optional_params,
     _parse_time,
-    _preview_token,
-    _require_confirmation,
+    _resolve_video,
     _video_ref,
     _when,
     _with_next,
@@ -48,7 +47,7 @@ def _resolve_params(
     mode: str,
     total_length: int,
     format: str,
-    resolution: str,
+    resolution: str | None,
     audio_mode: str | None,
     workflow: str | None,
     niche: str | None,
@@ -57,7 +56,7 @@ def _resolve_params(
         mode=_bounded_text(mode, "mode", 32, required=True),
         total_length=total_length,
         format=_bounded_text(format, "format", 64, required=True),
-        resolution=_bounded_text(resolution, "resolution", 32, required=True),
+        resolution=_bounded_text(resolution, "resolution", 32),
         audio_mode=_bounded_text(audio_mode, "audio_mode", 32),
         workflow=_bounded_text(workflow, "workflow", 64),
         niche=_bounded_text(niche, "niche", 10_000),
@@ -69,7 +68,7 @@ def _create_params(
     total_length: int,
     format: str,
     mode: str,
-    resolution: str,
+    resolution: str | None,
     style: str | None,
     audio_mode: str | None,
     narrator_voice: str | None,
@@ -82,7 +81,7 @@ def _create_params(
         total_length=total_length,
         format=_bounded_text(format, "format", 64, required=True),
         mode=_bounded_text(mode, "mode", 32, required=True),
-        resolution=_bounded_text(resolution, "resolution", 32, required=True),
+        resolution=_bounded_text(resolution, "resolution", 32),
         style=_bounded_text(style, "style", 200),
         audio_mode=_bounded_text(audio_mode, "audio_mode", 32),
         narrator_voice=_bounded_text(narrator_voice, "narrator_voice", 64),
@@ -229,15 +228,16 @@ async def _quote(
     settings, defaults to ``params``) so a bad choice fails here, before any credits are held.
     """
     now = datetime.now(UTC)
-    config, quote, credits, jobs = await asyncio.gather(
-        _api(backend, "GET", "/api/config"),
-        _api(backend, "GET", "/api/resolve", params=params),
+    config = _dict_result(await _api(backend, "GET", "/api/config"))
+    quote, credits, jobs = await asyncio.gather(
+        _resolve_video(backend, params, config),
         _api(backend, "GET", "/api/payments/credit-status"),
         # Only the last hour matters for the failure warning; skip the other 200 rows' signed URLs.
         _api(backend, "GET", "/api/jobs", params={"updated_since": (now - timedelta(hours=1)).isoformat()}),
     )
-    _check_choices(config, body or params)
     quote = {key: value for key, value in _dict_result(quote).items() if key != "estimated_cost"}
+    requested = body or params
+    _check_choices(config, {**requested, "format": quote.get("format") or requested.get("format")})
     adjustments = _adjustments(params, quote)
     if adjustments:
         quote["adjustments"] = adjustments
@@ -424,7 +424,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     async def get_video_options(
         format: Annotated[str, Field(max_length=64, description="Format to list valid lengths for.")] = "auto",
         mode: Annotated[str, Field(max_length=32, description="Mode to list valid lengths for.")] = "lite",
-        resolution: Annotated[str, Field(max_length=32, description="Resolution to list valid lengths for.")] = "720p",
+        resolution: Annotated[str | None, Field(max_length=32, description="Resolution to list valid lengths for; omit for the selected format's default.")] = None,
         niche: Annotated[str | None, Field(max_length=10_000, description="The topic, so auto lists the lengths of the format it would pick.")] = None,
     ) -> dict[str, Any]:
         """Use when the user wants to make a video or series and you need the real choices:
@@ -445,25 +445,28 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Example: user picks the pov format -> get_video_options(format="pov", niche=topic) and
         offer 2-4 of the returned lengths.
         """
-        config, lengths = await asyncio.gather(
-            _api(backend, "GET", "/api/config"),
-            _api(
-                backend,
-                "GET",
-                "/api/lengths",
-                params={
-                    "format": _bounded_text(format, "format", 64, required=True),
-                    "mode": _bounded_text(mode, "mode", 32, required=True),
-                    "resolution": _bounded_text(resolution, "resolution", 32, required=True),
-                    **_optional_params(niche=_bounded_text(niche, "niche", 10_000)),
-                },
-            ),
-        )
+        selected_format = _bounded_text(format, "format", 64, required=True)
+        selected_mode = _bounded_text(mode, "mode", 32, required=True)
+        topic = _bounded_text(niche, "niche", 10_000)
+        config = _dict_result(await _api(backend, "GET", "/api/config"))
+        resolved = await _resolve_video(backend, _resolve_params(
+                mode=selected_mode, total_length=30, format=selected_format,
+                resolution=resolution, audio_mode=None, workflow=None, niche=topic,
+            ), config)
+        chosen = resolved
+        lengths = await _api(backend, "GET", "/api/lengths", params=_optional_params(
+            format=chosen.get("format") or selected_format,
+            mode=selected_mode,
+            resolution=chosen.get("resolution") or resolution,
+            niche=topic,
+        ))
         config = _strip_previews(config)
         return {
             "choices": _plain_choices(config),
             "config": config,
             "lengths": lengths,
+            "selected_settings": {"format": chosen.get("format") or selected_format,
+                                  "resolution": chosen.get("resolution") or resolution},
         }
 
     @server.tool(
@@ -475,7 +478,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         total_length: Annotated[int, Field(ge=1, le=3600, description="Requested duration in seconds.")],
         mode: Annotated[str, Field(max_length=32, description="Generation mode, usually lite.")] = "lite",
         format: Annotated[str, Field(max_length=64, description="Format id from get_video_options; auto picks one.")] = "auto",
-        resolution: Annotated[str, Field(max_length=32, description="Output resolution.")] = "720p",
+        resolution: Annotated[str | None, Field(max_length=32, description="Output resolution; omit to use the selected format's default.")] = None,
         audio_mode: Annotated[str | None, Field(max_length=32, description="Optional sound choice, such as narration.")] = None,
         workflow: Annotated[str | None, Field(max_length=64, description="Optional workflow name.")] = None,
         niche: Annotated[str | None, Field(max_length=10_000, description="The topic; lets auto pick the real format.")] = None,
@@ -606,7 +609,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         total_length: Annotated[int, Field(ge=1, le=3600, description="Requested duration in seconds.")],
         format: Annotated[str, Field(max_length=64, description="Format id from get_video_options; auto picks one.")] = "auto",
         mode: Annotated[str, Field(max_length=32, description="Quality: a mode id from get_video_options (lite is Standard).")] = "lite",
-        resolution: Annotated[str, Field(max_length=32, description="Output resolution.")] = "720p",
+        resolution: Annotated[str | None, Field(max_length=32, description="Output resolution; omit to use the selected format's default.")] = None,
         style: Annotated[str | None, Field(max_length=200, description="Optional visual style for this format; omit for auto.")] = None,
         audio_mode: Annotated[str | None, Field(max_length=32, description="Optional sound choice, such as narration.")] = None,
         narrator_voice: Annotated[str | None, Field(max_length=64, description="Optional narrator voice.")] = None,
@@ -661,20 +664,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         )
         quote = await _quote(backend, params, body)
         settings = _effective(body, quote)
-        token = _preview_token({**settings, "credits": quote.get("estimated_credits")})
-        if not confirm:
+        preview = {"action": "create_video", "settings": settings,
+                   "estimated_cost": quote.get("estimated_credits"),
+                   "side_effects": ["Hold credits and queue video generation"]}
+        approval = _approval(preview, confirm, preview_token, "create_video")
+        if approval is not None:
             return {
-                "status": "needs_approval",
+                **approval,
                 **quote,
                 "settings": settings,
-                "preview_token": token,
-                "next_step": (
-                    "Show the user the summary (and any adjustments or warning) and ask to go ahead. "
-                    "On yes, call create_video again with the same settings, confirm=true and "
-                    f"preview_token={token!r}."
-                ),
             }
-        _check_token(preview_token, token, "create_video")
         result = _dict_result(await _api(backend, "POST", "/api/jobs", body=_pinned(body, settings)))
         # A new video comes back as {id, status, credits_cost}; an existing one for the same key
         # comes back whole (with its topic): that is a replay, nothing new was made or charged.
@@ -718,6 +717,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
     async def control_video(
         job_id: JobId,
         action: Annotated[Literal["cancel", "pause"], Field(description="Job action to perform.")],
+        preview_token: PreviewToken = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
         """Use when the user wants to stop or pause one video that is being made, after approval.
@@ -730,7 +730,17 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         for the video to actually stop, so the summary says whether the credits are already back.
         """
         job_id = await _video_ref(backend, job_id)
-        _require_confirmation(confirm, f"Video {action}")
+        current = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
+        if current.get("status") not in {"pending", "queued", "processing", "paused"}:
+            raise _fail("wrong_state", f"This video is {_label(current.get('status')).lower()}, so there is nothing to {action}.")
+        if action == "pause" and current.get("status") == "paused":
+            return {"status": "unchanged", "summary": "This video is already paused."}
+        preview = {"action": action, "video_id": job_id, "video_status": current.get("status"),
+                   "credits_held": current.get("credits_cost"),
+                   "side_effects": ["Refund held credits" if action == "cancel" else "Keep held credits while paused"]}
+        approval = _approval(preview, confirm, preview_token, "control_video")
+        if approval is not None:
+            return approval
         try:
             result = _dict_result(await _api(backend, "POST", f"/api/jobs/{job_id}/{action}"))
         except ToolError:
@@ -784,16 +794,6 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 "Only a video that failed, was cancelled or is paused can be.",
             )
         cost = 0 if status == "paused" else int(row.get("credits_cost") or 0)
-        token = _preview_token({"video": job_id, "status": status, "credits": cost})
-        if confirm:
-            _check_token(preview_token, token, "retry_video")
-            await _api(backend, "POST", f"/api/jobs/{job_id}/retry")
-            return _with_next(
-                _job_summary({**_dict_result(job), "status": "pending"}),
-                "Queued, not ready. Check with get_video when the user asks; do not poll in a loop.",
-                ("Resumed for free. " if status == "paused" else f"Trying it again ({cost:,} credits). ")
-                + "It takes a few minutes; ask me to check on it any time.",
-            )
         balance = _dict_result(credits).get("balance")
         name = f"\"{row.get('title')}\"" if row.get("title") else "This video"
         if status == "paused":
@@ -806,12 +806,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 f". You have {balance:,}." if isinstance(balance, int | float) else ".")
         preview = {
             **row,
-            "status": "needs_approval",
             "credits": cost,
-            "preview_token": token,
             "summary": summary,
-            "next_step": "Show the summary and ask to go ahead. On yes, call retry_video again with "
-                         f"confirm=true and preview_token={token!r}.",
         }
         if isinstance(balance, int | float):
             preview.update(balance=balance, can_afford=balance >= cost)
@@ -821,7 +817,18 @@ def register(server: MCPServer, backend: BackendClient) -> None:
                 f"{failures} of your videos failed in the last hour, so this one may fail again. "
                 "Credits come back if it does, but it may be better to wait a little."
             )
-        return preview
+        operation = {"action": "retry_video", "video_id": job_id, "video_status": status,
+                     "estimated_cost": cost, "side_effects": ["Queue generation again"]}
+        approval = _approval(operation, confirm, preview_token, "retry_video")
+        if approval is not None:
+            return {**preview, **approval}
+        await _api(backend, "POST", f"/api/jobs/{job_id}/retry")
+        return _with_next(
+            _job_summary({**_dict_result(job), "status": "pending"}),
+            "Queued, not ready. Check with get_video when the user asks; do not poll in a loop.",
+            ("Resumed for free. " if status == "paused" else f"Trying it again ({cost:,} credits). ")
+            + "It takes a few minutes; ask me to check on it any time.",
+        )
 
     @server.tool(
         title="Edit video title and details",
@@ -837,6 +844,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             Literal["public", "unlisted", "private"] | None,
             Field(description="Optional YouTube visibility update."),
         ] = None,
+        preview_token: PreviewToken = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
         """Use when the user wants to change a video's title, description, tags or YouTube
@@ -848,7 +856,6 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: the updated video, ``changed`` (from/to, for undo), ``live_update`` and ``summary``.
         """
         job_id = await _video_ref(backend, job_id)
-        _require_confirmation(confirm, "Video details update")
         body = _optional_params(
             title=_bounded_text(title, "title", 500),
             description=description.strip() if description is not None else None,
@@ -858,8 +865,15 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         if not body:
             raise _fail("invalid_input", "Provide at least one detail to change.")
         before = _dict_result(await _api(backend, "GET", f"/api/jobs/{job_id}"))
-        result = _dict_result(await _api(backend, "PATCH", f"/api/jobs/{job_id}", body=body))
         changed = {k: {"from": before.get(k), "to": v} for k, v in body.items() if before.get(k) != v}
+        if not changed:
+            return {"status": "unchanged", "summary": "These video details are already set."}
+        preview = {"action": "update_video_details", "video_id": job_id, "changes": changed,
+                   "side_effects": ["May update an already published YouTube video"]}
+        approval = _approval(preview, confirm, preview_token, "update_video_details")
+        if approval is not None:
+            return approval
+        result = _dict_result(await _api(backend, "PATCH", f"/api/jobs/{job_id}", body=body))
         if isinstance(result.get("job"), dict):
             result["job"] = _job_summary(result["job"])
         return _with_next(

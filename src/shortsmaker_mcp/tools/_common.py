@@ -8,8 +8,11 @@ conversation into a credit-spending or publishing action.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import re
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
@@ -22,6 +25,9 @@ from pydantic import Field
 from ..backend_client import BackendAPIError, BackendClient, BackendUnavailable
 from ..config import APP_URL, BILLING_URL
 from ..oauth_auth import current_principal
+
+_APPROVAL_KEY = (os.getenv("MCP_BRIDGE_SECRET") or "").encode() or secrets.token_bytes(32)
+_APPROVAL_TTL = timedelta(minutes=15)
 
 Niche = Annotated[
     str,
@@ -391,10 +397,18 @@ def _backend_error(exc: Exception, write: bool = False, spends: bool = False) ->
     message += unused + (_wait(exc.retry_after) if status == 429 else "")
     return _fail(_CODES.get(status, "invalid_input"), message + _NEXT_STEP.get(status, ""))
 
-def _preview_token(approved: dict[str, Any]) -> str:
-    """A fingerprint of exactly what the user approved (settings and price). Confirm recomputes it
-    from a fresh read; any difference means the preview drifted, so nothing runs."""
-    return "p-" + hashlib.sha256(json.dumps(approved, sort_keys=True, default=str).encode()).hexdigest()[:16]
+def _preview_token(approved: dict[str, Any], *, tool: str = "") -> str:
+    """Sign an operation for this user and client; the token expires after fifteen minutes."""
+    principal = current_principal()
+    expires = int((datetime.now(UTC) + _APPROVAL_TTL).timestamp())
+    stamp = format(expires, "x")
+    payload = json.dumps(
+        [principal.user_id, principal.client_id, tool, approved],
+        sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()
+    operation = hmac.new(_APPROVAL_KEY, payload, hashlib.sha256).hexdigest()[:24]
+    signature = hmac.new(_APPROVAL_KEY, f"{stamp}.{operation}".encode(), hashlib.sha256).hexdigest()[:24]
+    return f"p-{stamp}.{operation}.{signature}"
 
 
 def _check_token(given: str | None, expected: str, tool: str) -> None:
@@ -404,7 +418,23 @@ def _check_token(given: str | None, expected: str, tool: str) -> None:
             f"Nothing was done. Call {tool} without confirm first, show the user the preview, then "
             "confirm with its preview_token.",
         )
-    if given != expected:
+    try:
+        prefix, operation, signature = given.split(".")
+        stamp = prefix.removeprefix("p-")
+        expiry = int(stamp, 16)
+        expected_operation = expected.split(".")[1]
+        valid = (
+            prefix.startswith("p-")
+            and datetime.now(UTC).timestamp() <= expiry
+            and hmac.compare_digest(operation, expected_operation)
+            and hmac.compare_digest(
+                signature,
+                hmac.new(_APPROVAL_KEY, f"{stamp}.{operation}".encode(), hashlib.sha256).hexdigest()[:24],
+            )
+        )
+    except (ValueError, IndexError):
+        valid = False
+    if not valid:
         raise _fail(
             "preview_changed",
             f"The price or settings changed since the user approved them. Nothing was done. Call {tool} "
@@ -412,10 +442,25 @@ def _check_token(given: str | None, expected: str, tool: str) -> None:
         )
 
 
-PreviewToken = Annotated[str | None, Field(max_length=40, description=(
+PreviewToken = Annotated[str | None, Field(max_length=80, description=(
     "Required with confirm=true: the preview_token from the preview the user approved. If the "
     "price or settings changed since, nothing happens and you are told to preview again."
 ))]
+
+
+def _approval(
+    preview: dict[str, Any], confirm: bool, preview_token: str | None, tool: str,
+) -> dict[str, Any] | None:
+    """Return a preview or validate approval of the freshly rebuilt operation."""
+    token = _preview_token(preview, tool=tool)
+    if confirm:
+        _check_token(preview_token, token, tool)
+        return None
+    return {
+        "status": "needs_approval", "preview": preview, "preview_token": token,
+        **({"estimated_cost": preview["estimated_cost"]} if preview.get("estimated_cost") is not None else {}),
+        "next_step": f"Show this preview and ask for approval. Then call {tool} with confirm=true and preview_token={token!r}.",
+    }
 
 
 def _require_confirmation(confirm: bool, action: str) -> None:
@@ -473,6 +518,61 @@ async def _api(
             path == "/api/jobs" or (path.endswith("/retry") and not path.startswith("/api/posts"))
         )
         raise _backend_error(exc, write=method.upper() != "GET", spends=spends) from exc
+
+
+def _choice_ids(values: Any) -> list[str]:
+    return [str(item.get("id")) if isinstance(item, dict) else str(item)
+            for item in values] if isinstance(values, list) else []
+
+
+async def _resolve_video(
+    backend: BackendClient, params: dict[str, Any], config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pin a supported resolution before calling the legacy API, whose default is always 720p."""
+    config = config if isinstance(config, dict) else _dict_result(await _api(backend, "GET", "/api/config"))
+    fmt, asked = params.get("format") or "transformation", params.get("resolution")
+    by_format = config.get("resolutions_by_format") or {}
+    entry = by_format.get(fmt) if isinstance(by_format, dict) else None
+    offered = _choice_ids(entry.get("available")) if isinstance(entry, dict) else _choice_ids(entry)
+    all_options = _choice_ids(config.get("resolutions"))
+    if not all_options and isinstance(by_format, dict):
+        all_options = list(dict.fromkeys(
+            choice for value in by_format.values()
+            for choice in _choice_ids(value.get("available") if isinstance(value, dict) else value)
+        ))
+    if asked and fmt != "auto" and offered and asked not in offered:
+        raise _fail("invalid_input", f"This format doesn't offer resolution {asked!r}; it offers {', '.join(offered)}.")
+    if asked:
+        candidates = [asked]
+    else:
+        default = entry.get("default") if isinstance(entry, dict) else None
+        pool = offered + [choice for choice in all_options if choice not in offered]
+        if not pool:
+            # Older engine catalogues may omit resolution metadata. Preserve its documented
+            # API default explicitly; /resolve remains the authority and validates the pair.
+            pool = ["720p"]
+        preferred = default if default in pool else "720p" if "720p" in pool else pool[0]
+        candidates = [preferred, *(choice for choice in pool if choice != preferred)]
+
+    last_error: ToolError | None = None
+    for index, choice in enumerate(candidates):
+        try:
+            quote = _dict_result(await _api(
+                backend, "GET", "/api/resolve", params={**params, "resolution": choice},
+            ))
+            quote.setdefault("format", fmt)
+            quote.setdefault("resolution", choice)
+            return quote
+        except ToolError as exc:
+            message = str(exc).lower()
+            if asked or index == len(candidates) - 1 or not (
+                "resolution" in message and ("offer" in message or "support" in message)
+            ):
+                raise
+            last_error = exc
+    if last_error:
+        raise last_error
+    raise _fail("invalid_input", "No supported video resolution is available.")
 
 
 # ---- Finding things by name ----
