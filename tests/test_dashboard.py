@@ -84,4 +84,6 @@ def test_dashboard_exposes_explicitly_gated_write_controls():
         assert removed not in html
 
     assert "confirm: true" in html
+    assert "window.confirm(`Approve this exact action?" in html
+    assert 'placeholder="Auto: use the format\'s supported resolution"' in html
     assert "newIdempotencyKey" in html

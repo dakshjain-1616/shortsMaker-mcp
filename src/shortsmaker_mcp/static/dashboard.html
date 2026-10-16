@@ -70,7 +70,7 @@
         <label for="price-format">Format</label>
         <input id="price-format" type="text" maxlength="64" value="transformation" />
         <label for="price-resolution">Resolution</label>
-        <input id="price-resolution" type="text" maxlength="32" value="720p" />
+        <input id="price-resolution" type="text" maxlength="32" placeholder="Auto: use the format's supported resolution" />
         <label for="price-audio">Audio mode (optional)</label>
         <input id="price-audio" type="text" maxlength="32" placeholder="Leave blank for backend default" />
         <label for="price-workflow">Workflow (optional)</label>
@@ -297,12 +297,18 @@
         setStatus(successMessage, "success");
       }
 
-      // Money-spending tools preview first; the checkbox is the approval, so confirm with its token.
+      // Show the resolved operation before asking for the browser's explicit approval.
       async function callApproved(name, argumentsValue, successMessage) {
         if (!sessionId) await initializeSession();
-        const preview = await rpc("tools/call", { name, arguments: argumentsValue }, 2);
+        const preview = await rpc("tools/call", { name, arguments: { ...argumentsValue, confirm: false } }, 2);
         const previewToken = preview && preview.structuredContent && preview.structuredContent.preview_token;
-        if (!previewToken) return displayToolResult(preview);
+        displayToolResult(preview);
+        if (!previewToken) return;
+        const operation = preview.structuredContent.preview || preview.structuredContent;
+        if (!window.confirm(`Approve this exact action?\n\n${JSON.stringify(operation, null, 2)}`)) {
+          setStatus("Action canceled after preview.");
+          return;
+        }
         return callTool(name, { ...argumentsValue, preview_token: previewToken, confirm: true }, successMessage);
       }
 
@@ -343,15 +349,15 @@
         const mode = inputValue("price-mode");
         const format = inputValue("price-format");
         const resolution = inputValue("price-resolution");
-        if (!mode || !format || !resolution) {
-          throw new Error("Mode, format, and resolution are required.");
+        if (!mode || !format) {
+          throw new Error("Mode and format are required.");
         }
         const argumentsValue = {
           total_length: lengthValue,
           mode,
           format,
-          resolution,
         };
+        if (resolution) argumentsValue.resolution = resolution;
         for (const [key, id] of [["niche", "price-niche"], ["audio_mode", "price-audio"], ["workflow", "price-workflow"]]) {
           const optional = inputValue(id);
           if (optional) argumentsValue[key] = optional;
@@ -424,7 +430,7 @@
         const jobId = requiredValue("control-job-id", "Job UUID");
         const action = document.getElementById("control-action").value;
         if (action === "retry") return callApproved("retry_video", { job_id: jobId }, "Video retry submitted to staging.");
-        return callTool("control_video", { job_id: jobId, action, confirm: true }, "Video action submitted to staging.");
+        return callApproved("control_video", { job_id: jobId, action }, "Video action submitted to staging.");
       });
 
       document.getElementById("update-metadata").onclick = () => runAction(() => {
@@ -439,12 +445,12 @@
         const visibility = document.getElementById("metadata-visibility").value;
         if (visibility) argumentsValue.visibility = visibility;
         if (Object.keys(argumentsValue).length === 2) throw new Error("Provide at least one metadata field.");
-        return callTool("update_video_details", argumentsValue, "Video metadata updated through MCP.");
+        return callApproved("update_video_details", argumentsValue, "Video metadata updated through MCP.");
       });
 
       document.getElementById("start-connection").onclick = () => runAction(() => {
         if (!checked("connection-confirm")) throw new Error("Check the connection confirmation first.");
-        return callTool("connect_account", {
+        return callApproved("connect_account", {
           platform: document.getElementById("connection-platform").value,
           confirm: true,
         }, "Authorization URL created. Open it from the output to continue.");
@@ -452,7 +458,7 @@
 
       document.getElementById("disconnect").onclick = () => runAction(() => {
         if (!checked("disconnect-confirm")) throw new Error("Check the disconnect confirmation first.");
-        return callTool("disconnect_account", {
+        return callApproved("disconnect_account", {
           connection_id: requiredValue("disconnect-id", "Connection UUID"),
           confirm: true,
         }, "Social account disconnect submitted to staging.");
@@ -476,12 +482,12 @@
         }
         const tags = csvValues("publish-tags");
         if (tags.length) argumentsValue.tags = tags;
-        return callTool("publish_video", argumentsValue, "Post queued through MCP; check post status for completion.");
+        return callApproved("publish_video", argumentsValue, "Post queued through MCP; check post status for completion.");
       });
 
       document.getElementById("control-post").onclick = () => runAction(() => {
         if (!checked("post-confirm")) throw new Error("Check the post-action confirmation first.");
-        return callTool("control_post", {
+        return callApproved("control_post", {
           post_id: requiredValue("post-id", "Post UUID"),
           action: document.getElementById("post-action").value,
           confirm: true,

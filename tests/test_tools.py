@@ -8,6 +8,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from shortsmaker_mcp import tools
+from shortsmaker_mcp.backend_client import BackendAPIError
 from shortsmaker_mcp.oauth_auth import Principal, _principal
 from shortsmaker_mcp.tools import _common, video, workflows
 
@@ -119,19 +120,117 @@ def test_registered_tools_expose_risk_annotations_and_structured_schemas():
 
 def _routes(responses):
     """A backend that answers by path; POSTs return responses["POST " + path]."""
+    config = {
+        "resolutions": ["720p", "1080p"],
+        "resolutions_by_format": {
+            "transformation": {"available": ["720p", "1080p"], "default": "720p"},
+            "asmr": {"available": ["1080p"], "default": "1080p"},
+            "pov": {"available": ["720p", "1080p"], "default": "720p"},
+        },
+    }
     async def respond(method, path, token, **kwargs):
         key = path if method == "GET" else f"{method} {path}"
+        if method == "GET" and path == "/api/config" and path not in responses:
+            return config
         return responses.get(key, {})
     return respond
 
 
 PRICED = {
-    "/api/config": {},
+    "/api/config": {
+        "resolutions": ["720p", "1080p"],
+        "resolutions_by_format": {
+            "transformation": {"available": ["720p", "1080p"], "default": "720p"},
+            "asmr": {"available": ["1080p"], "default": "1080p"},
+        },
+    },
     "/api/resolve": {"estimated_credits": 18, "total_length": 15, "requested_length": 15},
     "/api/payments/credit-status": {"balance": 120},
     "/api/jobs": [],
     "POST /api/jobs": {"id": "job-1", "status": "queued", "credits_cost": 18},
 }
+
+
+def test_omitted_resolution_is_pinned_for_the_legacy_backend():
+    server, backend = _registered_tools()
+    backend.request.side_effect = _routes(PRICED)
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        asyncio.run(server._tool_manager._tools["get_video_price"].fn(12, niche="A satisfying marble rolling through a neon obstacle course."))
+        asyncio.run(server._tool_manager._tools["create_video"].fn("A satisfying marble rolling through a neon obstacle course.", 12))
+    finally:
+        _principal.reset(context)
+    resolves = [call.kwargs["params"] for call in backend.request.await_args_list
+                if call.args[:2] == ("GET", "/api/resolve")]
+    assert len(resolves) == 2
+    assert all(params["resolution"] == "720p" for params in resolves)
+
+
+def test_auto_resolution_retries_supported_catalogue_choices_on_resolution_error():
+    server, backend = _registered_tools()
+    calls = []
+
+    async def respond(method, path, token, **kwargs):
+        if path == "/api/config":
+            return PRICED["/api/config"]
+        if path == "/api/resolve":
+            params = kwargs["params"]
+            calls.append(params["resolution"])
+            if params["resolution"] == "720p":
+                raise BackendAPIError(422, "This format doesn't offer resolution '720p'; it offers 1080p.")
+            return {"format": "asmr", "resolution": "1080p", "estimated_credits": 53,
+                    "estimated_cost": .53, "total_length": 12, "requested_length": 12}
+        return PRICED.get(path if method == "GET" else f"{method} {path}", {})
+
+    backend.request.side_effect = respond
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        quote = asyncio.run(server._tool_manager._tools["get_video_price"].fn(
+            12, niche="A satisfying marble rolling through a neon obstacle course."))
+    finally:
+        _principal.reset(context)
+    assert calls == ["720p", "1080p"]
+    assert quote["format"] == "asmr" and quote["resolution"] == "1080p"
+    assert quote["estimated_credits"] == 53
+
+
+def test_marble_price_and_approved_creation_use_the_same_supported_settings():
+    server, backend = _registered_tools()
+    prompt = "A satisfying marble rolling through a neon obstacle course."
+    resolves = []
+
+    async def respond(method, path, token, **kwargs):
+        if path == "/api/config":
+            return PRICED["/api/config"]
+        if path == "/api/resolve":
+            params = kwargs["params"]
+            resolves.append((params.get("format"), params["resolution"]))
+            if params["resolution"] == "720p":
+                raise BackendAPIError(422, "This format doesn't offer resolution '720p'; it offers 1080p.")
+            return {"format": "asmr", "resolution": "1080p", "estimated_credits": 53,
+                    "total_length": 12, "requested_length": 12}
+        key = path if method == "GET" else f"{method} {path}"
+        return PRICED.get(key, {})
+
+    backend.request.side_effect = respond
+    create = server._tool_manager._tools["create_video"].fn
+    price = server._tool_manager._tools["get_video_price"].fn
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        quote = asyncio.run(price(12, niche=prompt))
+        preview = asyncio.run(create(prompt, 12))
+        result = asyncio.run(create(prompt, 12, preview_token=preview["preview_token"], confirm=True))
+    finally:
+        _principal.reset(context)
+
+    assert quote["format"] == preview["settings"]["format"] == "asmr"
+    assert quote["resolution"] == preview["settings"]["resolution"] == "1080p"
+    assert quote["estimated_credits"] == preview["estimated_credits"] == 53
+    assert result["status"] == "queued"
+    assert resolves == [("auto", "720p"), ("auto", "1080p")] * 3
+    create_body = next(call.kwargs["body"] for call in backend.request.await_args_list
+                       if call.args[:2] == ("POST", "/api/jobs"))
+    assert create_body["format"] == "asmr" and create_body["resolution"] == "1080p"
 
 
 def test_create_video_without_confirm_returns_a_preview_and_never_writes():
@@ -169,9 +268,14 @@ def test_create_video_confirmed_sends_a_stable_automatic_key_under_the_price_loc
     assert len(posts) == 1
     body = posts[0].kwargs["body"]
     assert body["niche"] == "deep sea animals" and body["idempotency_key"].startswith("auto-")
-    # Same settings, same key: a retry after a timeout can never charge twice.
-    assert video._auto_key({**body, "idempotency_key": "x"}) == body["idempotency_key"]
-    assert video._auto_key({**body, "total_length": 30}) != body["idempotency_key"]
+    # The key is derived from the original request before resolved settings are pinned.
+    request = video._create_params(
+        niche="deep sea animals", total_length=15, format="auto", mode="lite",
+        resolution=None, style=None, audio_mode=None, narrator_voice=None,
+        narration_language=None, music_track=None, idempotency_key="pending",
+    )
+    assert video._auto_key(request) == body["idempotency_key"]
+    assert video._auto_key({**request, "total_length": 30}) != body["idempotency_key"]
 
 
 def test_confirm_refuses_when_auto_picks_another_format_and_sends_the_previewed_one():
@@ -312,8 +416,8 @@ def test_create_series_previews_weekly_cost_then_forwards_the_confirmed_schedule
     # The video settings are priced first, so settings the backend cannot price fail now.
     resolve = next(c for c in backend.request.await_args_list if c.args[1] == "/api/resolve")
     assert resolve.kwargs["params"] == {
-        "mode": "lite", "total_length": 30, "format": "auto", "resolution": "720p",
-        "niche": "Ocean facts for short-form videos",
+        "mode": "lite", "total_length": 30, "format": "auto",
+        "niche": "Ocean facts for short-form videos", "resolution": "720p",
     }
     posts = [c for c in backend.request.await_args_list if c.args[0] == "POST"]
     assert len(posts) == 1
@@ -328,7 +432,7 @@ def test_create_series_previews_weekly_cost_then_forwards_the_confirmed_schedule
         "times_of_day": ["09:00", "17:30"],
         "lead_minutes": 360,
         "grace_minutes": 360,
-        "job_defaults": {"mode": "lite", "format": "auto", "resolution": "720p", "total_length": 30},
+        "job_defaults": {"mode": "lite", "format": "auto", "total_length": 30, "resolution": "720p"},
     }
 
 
@@ -493,14 +597,14 @@ def test_publish_refuses_repeat_posts_and_accounts_that_need_reconnecting():
         with pytest.raises(ToolError, match=r"MyChannel \(YouTube\): live.*already_posted"):
             asyncio.run(check(backend, "9", {yt}, False))
         # Connected, but posting doesn't reach Instagram: refused, not queued forever.
-        with pytest.raises(ToolError, match=r"Instagram isn't supported yet.*platform_unavailable"):
+        with pytest.raises(ToolError, match=r"Instagram is unavailable.*platform_unavailable"):
             asyncio.run(check(backend, "9", {ig}, True))
         # The user asked to repost.
         assert asyncio.run(check(backend, "9", {yt}, True)) == ({yt: "MyChannel (YouTube)"}, "")
-        # Posting is down: allowed, with a warning.
+        # Posting is down: fail before queueing, including on a retry.
         health["worker_alive"] = False
-        names, delayed = asyncio.run(check(backend, "9", {yt}, True))
-        assert delayed == publishing._DELAYED
+        with pytest.raises(ToolError, match="platform_unavailable"):
+            asyncio.run(check(backend, "9", {yt}, True))
     finally:
         _principal.reset(context)
 
@@ -515,6 +619,8 @@ def test_publish_preview_names_the_places_time_and_visibility():
             {"id": ig, "platform": "instagram", "account_name": "me", "status": "active"},
         ],
         "/api/posts": [],
+        "/api/publishing/health": {"worker_alive": True,
+                                    "operational_platforms": ["youtube", "instagram"]},
     })
     context = _principal.set(TEST_PRINCIPAL)
     try:
@@ -527,7 +633,41 @@ def test_publish_preview_names_the_places_time_and_visibility():
         'Post "Marble race" to MyChannel (YouTube), me (Instagram) right away, private. '
         "Instagram posts are always public."
     )
+    assert preview["status"] == "needs_approval"
+    assert preview["preview"]["accounts"] == {yt: "MyChannel (YouTube)", ig: "me (Instagram)"}
+    assert preview["preview_token"].startswith("p-")
     assert all(c.args[0] == "GET" for c in backend.request.await_args_list)
+
+
+def test_publish_needs_matching_preview_token_before_queueing():
+    server, backend = _registered_tools()
+    yt = str(UUID(int=1))
+    job_id = str(UUID(int=9))
+    backend.request.side_effect = _routes({
+        f"/api/jobs/{job_id}": {"id": job_id, "status": "ready", "title": "Marble race"},
+        "/api/connections": [{"id": yt, "platform": "youtube", "account_name": "Channel", "status": "active"}],
+        "/api/publishing/health": {"worker_alive": True, "operational_platforms": ["youtube"]},
+        "/api/posts": [],
+        "POST /api/posts": [{"id": "post-1", "status": "scheduled", "connection_id": yt}],
+    })
+    tool = server._tool_manager._tools["publish_video"]
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        preview = asyncio.run(tool.fn(job_id, [yt], "public"))
+        with pytest.raises(ToolError, match="needs_approval"):
+            asyncio.run(tool.fn(job_id, [yt], "public", confirm=True))
+        with pytest.raises(ToolError, match="preview_changed"):
+            asyncio.run(tool.fn(job_id, [yt], "private", confirm=True,
+                                    preview_token=preview["preview_token"]))
+        assert not any(c.args[0] == "POST" for c in backend.request.await_args_list)
+        result = asyncio.run(tool.fn(job_id, [yt], "public", confirm=True,
+                                     preview_token=preview["preview_token"]))
+        assert result["items"][0]["id"] == "post-1"
+        writes = [c for c in backend.request.await_args_list if c.args[0] == "POST"]
+        assert len(writes) == 1
+        assert "idempotency_key" not in writes[0].kwargs["body"]
+    finally:
+        _principal.reset(context)
 
 
 def test_names_resolve_to_one_item_or_ask_which():
@@ -548,16 +688,17 @@ def test_series_update_merges_video_settings_instead_of_replacing_them():
     )
     context = _principal.set(TEST_PRINCIPAL)
     try:
-        asyncio.run(server._tool_manager._tools["update_series"].fn(
-            UUID(int=1), job_defaults={"format": "pov"}, confirm=True,
-        ))
+        update = server._tool_manager._tools["update_series"].fn
+        preview = asyncio.run(update(UUID(int=1), job_defaults={"format": "pov"}))
+        asyncio.run(update(UUID(int=1), job_defaults={"format": "pov"},
+                           preview_token=preview["preview_token"], confirm=True))
     finally:
         _principal.reset(context)
 
     patch = next(c for c in backend.request.await_args_list if c.args[0] == "PATCH")
     assert patch.args[1] == f"/api/workflows/{UUID(int=1)}"
     assert patch.kwargs["body"]["job_defaults"] == {
-        "mode": "lite", "format": "pov", "resolution": "720p", "total_length": 30, "audio_mode": "narration",
+        "mode": "lite", "format": "pov", "total_length": 30, "audio_mode": "narration", "resolution": "720p",
     }
 
 
@@ -646,12 +787,32 @@ def test_post_states_cover_every_backend_status():
 def test_connected_is_not_the_same_as_can_post():
     from shortsmaker_mcp.tools import publishing
     yt = {"platform": "youtube", "status": "active"}
-    assert publishing._posting(yt, {}) == ("ok", "Working")  # health unknown: assume fine
-    assert publishing._posting(yt, {"worker_alive": True, "worker_platforms": ["tiktok"]})[0] == "unsupported"
-    assert publishing._posting(yt, {"worker_alive": False})[0] == "delayed"
+    assert publishing._posting(yt, {})[0] == "unavailable"
+    assert publishing._posting(yt, {"worker_alive": True, "worker_platforms": ["tiktok"]})[0] == "unavailable"
+    assert publishing._posting(yt, {"worker_alive": False})[0] == "unavailable"
     assert publishing._posting({**yt, "status": "error"}, {})[1] == "Reconnect first"
     row = publishing._connection_row(yt, {"worker_alive": True, "worker_platforms": ["youtube"]})
     assert row["status_label"] == "Connected" and row["can_post"] is True
+
+
+def test_publishing_health_reports_each_connected_platform():
+    server, backend = _registered_tools()
+    backend.request.side_effect = _routes({
+        "/api/publishing/health": {"worker_alive": True, "operational_platforms": ["youtube"]},
+        "/api/connections": [
+            {"id": "youtube-1", "platform": "youtube", "status": "active"},
+            {"id": "tiktok-1", "platform": "tiktok", "status": "active"},
+        ],
+    })
+    context = _principal.set(TEST_PRINCIPAL)
+    try:
+        result = asyncio.run(server._tool_manager._tools["check_publishing_health"].fn())
+    finally:
+        _principal.reset(context)
+    assert [(c["platform"], c["can_post"]) for c in result["accounts"]] == [
+        ("youtube", True), ("tiktok", False),
+    ]
+    assert "unavailable" in result["summary"]
 
 
 def test_series_slot_rows_show_video_posts_retries_and_the_fix():
@@ -715,7 +876,8 @@ def test_series_update_previews_before_and_after_then_offers_undo():
     context = _principal.set(TEST_PRINCIPAL)
     try:
         preview = asyncio.run(update(sid, times_of_day=["21:00"], name="Space"))
-        done = asyncio.run(update(sid, times_of_day=["21:00"], name="Space", confirm=True))
+        done = asyncio.run(update(sid, times_of_day=["21:00"], name="Space",
+                                  preview_token=preview["preview_token"], confirm=True))
     finally:
         _principal.reset(context)
 
@@ -762,7 +924,9 @@ def test_cancel_waits_for_the_video_to_stop_and_says_credits_are_back(monkeypatc
     monkeypatch.setattr(video, "_SETTLE_POLL", 0)
     server, backend = _registered_tools()
     jid = str(UUID(int=3))
-    states = iter([{"status": "processing"}, {"status": "cancelled", "credits_cost": 53}])
+    states = iter([{"status": "processing", "credits_cost": 53},
+                   {"status": "processing", "credits_cost": 53},
+                   {"status": "cancelled", "credits_cost": 53}])
 
     async def respond(method, path, token, **kwargs):
         return {"status": "cancelling"} if method == "POST" else {"id": jid, **next(states)}
@@ -770,7 +934,9 @@ def test_cancel_waits_for_the_video_to_stop_and_says_credits_are_back(monkeypatc
     backend.request.side_effect = respond
     context = _principal.set(TEST_PRINCIPAL)
     try:
-        result = asyncio.run(server._tool_manager._tools["control_video"].fn(jid, "cancel", confirm=True))
+        control = server._tool_manager._tools["control_video"].fn
+        preview = asyncio.run(control(jid, "cancel"))
+        result = asyncio.run(control(jid, "cancel", preview_token=preview["preview_token"], confirm=True))
     finally:
         _principal.reset(context)
     assert result["summary"] == "Cancelled. 53 credits returned."

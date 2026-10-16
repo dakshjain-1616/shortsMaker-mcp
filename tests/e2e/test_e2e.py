@@ -353,7 +353,7 @@ def test_create_video_end_to_end_and_summary_strips_large_fields(stack):
     }).structured_content
     assert created["status_label"] == "In line" and "replayed" not in created
     # The job is made with the previewed (snapped) length, not re-resolved from the ask.
-    post = next(c for c in backend_calls(stack) if c["method"] == "POST")
+    post = next(c for c in backend_calls(stack) if c["method"] == "POST" and c["path"] == "/api/jobs")
     assert post["body"]["total_length"] == 60
     assert "config" not in created and "owner" not in created
     assert call(stack, "get_credits").structured_content == {"balance": 90, "summary": "You have 90 credits."}
@@ -489,9 +489,6 @@ WRITE_ARGS = {
 }
 
 
-PREVIEW_TOOLS = {"create_video", "create_series", "publish_video", "update_series", "retry_video"}
-
-
 def test_every_write_tool_refuses_without_confirmation_and_never_reaches_backend(stack):
     tools = run(stack, lambda c: c.list_tools()).tools
     writes = {t.name for t in tools if not t.annotations.read_only_hint}
@@ -500,13 +497,7 @@ def test_every_write_tool_refuses_without_confirmation_and_never_reaches_backend
     for name in sorted(writes):
         for extra in ({}, {"confirm": False}):
             result = call(stack, name, {**WRITE_ARGS[name], **extra})
-            if name in PREVIEW_TOOLS:
-                # These answer an unconfirmed call with a preview to show the user (or refuse a
-                # missing video); either way only reads reach the backend, checked below.
-                assert result.is_error or result.structured_content["status"] == "needs_approval", name
-            else:
-                assert result.is_error, name
-                assert "confirm" in text(result).lower(), (name, text(result))
+            assert result.is_error or result.structured_content["status"] in {"needs_approval", "unchanged"}, name
     assert [c for c in backend_calls(stack) if c["method"] != "GET"] == []
 
 
@@ -524,12 +515,17 @@ def test_confirmed_writes_forward_to_the_right_backend_routes(stack):
     }
     # Editing and cancelling read the video around the write, so they need one that exists.
     job_id = make_video(stack, {"niche": "real", "total_length": 15}).structured_content["id"]
-    real = {"control_video": {"job_id": job_id}, "update_video_details": {"job_id": job_id}}
+    ready_id = make_video(stack, {"niche": "ready-to-publish", "total_length": 15}).structured_content["id"]
+    real = {"control_video": {"job_id": job_id}, "update_video_details": {"job_id": job_id},
+            "publish_video": {"job_id": ready_id}}
     for name in real:
         expected[name] = (expected[name][0], expected[name][1].replace(UUID0, job_id))
     for name, (method, path) in expected.items():
         start = len(backend_calls(stack))  # not cleared: clearing would also delete the video
-        result = call(stack, name, {**WRITE_ARGS[name], **real.get(name, {}), "confirm": True})
+        args = {**WRITE_ARGS[name], **real.get(name, {})}
+        preview = call(stack, name, args)
+        assert not preview.is_error, (name, text(preview))
+        result = call(stack, name, {**args, "preview_token": preview.structured_content["preview_token"], "confirm": True})
         assert not result.is_error, (name, text(result))
         writes = [(c["method"], c["path"]) for c in backend_calls(stack)[start:] if c["method"] != "GET"]
         assert writes == [(method, path)], name  # pre-flight reads are fine; exactly one write
@@ -593,8 +589,11 @@ def test_read_filters_still_accept_naive_updated_since(stack):
 
 
 def test_duplicate_connection_ids_are_deduplicated(stack):
-    call(stack, "publish_video", {"job_id": UUID0, "connection_ids": [UUID0, UUID0], "visibility": "public", "confirm": True})
-    post = next(c for c in backend_calls(stack) if c["method"] == "POST")
+    job_id = make_video(stack, {"niche": "ready-dedupe", "total_length": 15}).structured_content["id"]
+    args = {"job_id": job_id, "connection_ids": [UUID0, UUID0], "visibility": "public"}
+    preview = call(stack, "publish_video", args)
+    call(stack, "publish_video", {**args, "preview_token": preview.structured_content["preview_token"], "confirm": True})
+    post = next(c for c in backend_calls(stack) if c["method"] == "POST" and c["path"] == "/api/posts")
     assert post["body"]["connection_ids"] == [UUID0]
 
 

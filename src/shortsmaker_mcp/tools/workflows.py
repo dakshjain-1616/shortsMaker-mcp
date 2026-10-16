@@ -26,6 +26,7 @@ from ._common import (
     WorkflowSlotId,
     _account_refs,
     _api,
+    _approval,
     _bounded_text,
     _check_token,
     _clean_tags,
@@ -39,7 +40,7 @@ from ._common import (
     _post_state,
     _preview_token,
     _public_text,
-    _require_confirmation,
+    _resolve_video,
     _series_ref,
     _when,
     _with_next,
@@ -68,7 +69,7 @@ def _workflow_times(times: list[str]) -> list[str]:
 
 # A series video is priced from these when they are made; without mode and length the backend
 # cannot price it and every slot is skipped, so a series that looks active never posts.
-_JOB_DEFAULTS = {"mode": "lite", "format": "auto", "resolution": "720p"}
+_JOB_DEFAULTS = {"mode": "lite", "format": "auto"}
 
 
 def _check_timezone(timezone: str | None) -> None:
@@ -98,14 +99,36 @@ def _check_length(defaults: dict[str, Any]) -> None:
 
 async def _priced_defaults(backend: BackendClient, defaults: dict[str, Any], theme: str | None) -> dict[str, Any]:
     """Price one video with these settings now, so bad settings fail here, not silently later."""
-    return _dict_result(await _api(backend, "GET", "/api/resolve", params=_optional_params(
+    params = _optional_params(
         mode=defaults.get("mode"),
         total_length=defaults.get("total_length"),
         format=defaults.get("format"),
         resolution=defaults.get("resolution"),
         audio_mode=defaults.get("audio_mode"),
         niche=theme,
-    )))
+    )
+    config = _dict_result(await _api(backend, "GET", "/api/config"))
+    return await _resolve_video(backend, params, config)
+
+
+def _pin_defaults(defaults: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    return {**defaults, **{key: quote[key] for key in (
+        "format", "resolution", "workflow", "total_length", "audio_mode",
+    ) if quote.get(key) not in (None, "")}}
+
+
+async def _slot_details(backend: BackendClient, slot_id: str) -> dict[str, Any]:
+    """Find a slot through the backend's existing per-series calendar route."""
+    series = await _api(backend, "GET", "/api/workflows")
+    for item in series if isinstance(series, list) else []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        slots = await _api(backend, "GET", f"/api/workflows/{item['id']}/slots")
+        match = next((slot for slot in slots if isinstance(slot, dict)
+                      and str(slot.get("id")) == str(slot_id)), None) if isinstance(slots, list) else None
+        if match:
+            return match
+    raise _fail("not_found", "That scheduled video was not found in your series. Nothing changed.")
 
 
 def _short_name(theme: str) -> str:
@@ -212,7 +235,7 @@ def _account_names(connections: Any) -> dict[str, str]:
 def _series_view(series: dict[str, Any], accounts: dict[str, str]) -> dict[str, Any]:
     """Add the plain-language fields: status label, schedule line and next video time."""
     view = {**series, "status_label": _label(series.get("status")), "schedule": _schedule_line(series, accounts)}
-    if series.get("next_slot_at") and series.get("status") == "active":
+    if series.get("next_slot_at") and series.get("status") == "active" and series.get("health_state") != "blocked":
         view["next_video"] = _when(series["next_slot_at"], series.get("timezone"))
     return view
 
@@ -229,7 +252,9 @@ async def _live_view(backend: BackendClient, series: Any) -> tuple[dict[str, Any
         (item for item in listed if isinstance(item, dict) and item.get("id") == series.get("id")), None,
     ) if isinstance(listed, list) else None
     if match:
-        series = {**series, **{k: match[k] for k in ("next_slot_at", "counts", "held_posts") if k in match}}
+        series = {**series, **{k: match[k] for k in (
+            "next_slot_at", "counts", "held_posts", "health_state", "health_reason", "next_action", "next_eligible_at"
+        ) if k in match}}
     return _series_view(series, _account_names(connections)), match is not None
 
 
@@ -299,6 +324,12 @@ def _show(field: str, value: Any, accounts: dict[str, str], tz: str | None) -> s
 
 def _series_summary(view: dict[str, Any]) -> str:
     text = f"\"{view.get('name') or 'Your series'}\" is {view['status_label'].lower()}: {view['schedule']}."
+    if view.get("health_state") in {"blocked", "degraded"}:
+        text += f" Health: {view['health_state']}."
+        if view.get("health_reason"):
+            text += f" {_public_text(str(view['health_reason']))}"
+        if view.get("next_action"):
+            text += f" Next action: {view['next_action']}."
     if view.get("next_video"):
         text += f" Next video {view['next_video']}."
     if view.get("status") == "paused" and view.get("last_error"):
@@ -596,10 +627,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         job_defaults = {**_JOB_DEFAULTS, "total_length": 30, **(job_defaults or {})}
         _check_length(job_defaults)
         cleaned_theme = _bounded_text(theme, "theme", 2000, required=True)
+        # Validate the complete local schedule before making pricing or account requests.
         body = _workflow_create_body(
             name=_bounded_text(name, "name", 120) or _short_name(cleaned_theme),
-            theme=theme,
-            connection_ids=await _account_refs(backend, connection_ids),
+            theme=cleaned_theme,
+            connection_ids=[str(value) for value in connection_ids],
             timezone=timezone,
             days_of_week=days_of_week,
             times_of_day=times_of_day,
@@ -619,9 +651,12 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             _api(backend, "GET", "/api/payments/credit-status"),
             _api(backend, "GET", "/api/connections"),
         )
+        job_defaults = _pin_defaults(job_defaults, quote)
+        body["connection_ids"] = await _account_refs(backend, connection_ids)
+        body["job_defaults"] = job_defaults
         accounts = _account_names(connections)
         schedule = _schedule_line(body, accounts)
-        token = _preview_token({**body, "credits": quote.get("estimated_credits")})
+        token = _preview_token({**body, "credits": quote.get("estimated_credits")}, tool="create_series")
         if not confirm:
             cost = _weekly_cost(quote.get("estimated_credits"), body, _dict_result(credits).get("balance"))
             summary = f"\"{body['name']}\": {schedule}."
@@ -683,6 +718,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         post_description: Annotated[str | None, Field(max_length=10_000, description="Replacement shared description.")] = None,
         post_tags: Annotated[list[str] | None, Field(max_length=100, description="Replacement shared tags.")] = None,
         job_defaults: Annotated[dict[str, Any] | None, Field(description="Replacement video settings, same keys as create_series.")] = None,
+        preview_token: PreviewToken = None,
         confirm: Confirm = False,
     ) -> dict[str, Any]:
         """Use when the user wants to change a series. Call it first without confirm: it
@@ -730,7 +766,8 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         if job_defaults is not None:
             # The backend replaces job_defaults whole; merge so a partial change keeps the rest.
             body["job_defaults"] = {**_JOB_DEFAULTS, **(current.get("job_defaults") or {}), **job_defaults}
-            await _priced_defaults(backend, body["job_defaults"], theme or current.get("theme"))
+            priced = await _priced_defaults(backend, body["job_defaults"], theme or current.get("theme"))
+            body["job_defaults"] = _pin_defaults(body["job_defaults"], priced)
         changes = _changes(current, body)
         if not changes:
             return {"status": "unchanged", "summary": "Nothing to change: the series is already set up that way."}
@@ -745,14 +782,11 @@ def register(server: MCPServer, backend: BackendClient) -> None:
             "any edits you made to them are lost."
         ) if planned and _REPLAN_FIELDS & set(changes) else None
         name = current.get("name") or "your series"
-        if not confirm:
-            return {
-                "status": "needs_approval",
-                "changes": changes,
-                **({"warning": warning} if warning else {}),
-                "summary": f"Change \"{name}\": {lines}." + (f" {warning}" if warning else ""),
-                "next_step": "Show the summary and ask. On yes, call update_series again with the same values and confirm=true.",
-            }
+        preview = {"target": {"id": series_id, "name": name}, "changes": changes,
+                   "side_effects": warning or "Series settings will be updated."}
+        approval = _approval(preview, confirm, preview_token, "update_series")
+        if approval:
+            return {**approval, "changes": changes, "summary": f"Change \"{name}\": {lines}." + (f" {warning}" if warning else "")}
         # Send only what really changes: resending an unchanged schedule field is harmless, but
         # sending just the diff keeps the backend's re-plan decision exactly what we warned about.
         view = await _live(backend, await _api(
@@ -770,7 +804,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=IDEMPOTENT_WRITE,
         structured_output=True,
     )
-    async def pause_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
+    async def pause_series(series_id: WorkflowId, confirm: Confirm = False, preview_token: PreviewToken = None) -> dict[str, Any]:
         """Use when the user wants a series to take a break without losing it.
 
         No new videos are made and queued posts are held until resume_series.
@@ -778,7 +812,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: the series with status "paused" and ``next_step``.
         """
         series_id = await _series_ref(backend, series_id)
-        _require_confirmation(confirm, "Pausing an Autopilot series")
+        current = _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
+        if current.get("status") == "paused":
+            return {"status": "unchanged", "summary": "This series is already paused."}
+        approval = _approval({"target": {"id": series_id, "name": current.get("name"), "status": current.get("status")},
+                              "action": "pause", "side_effects": "No new videos or posts until resumed."},
+                             confirm, preview_token, "pause_series")
+        if approval:
+            return approval
         view = await _live(backend, await _api(backend, "POST", f"/api/workflows/{series_id}/pause"))
         return _with_next(
             view,
@@ -795,6 +836,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         series_id: WorkflowId,
         ends_at: Annotated[AwareDatetime | None, Field(description="Optional new timezone-aware end date.")] = None,
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants a paused or stopped series to run again.
 
@@ -805,8 +847,16 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: the series with status "active", ``next_slot_at`` and ``next_step``.
         """
         series_id = await _series_ref(backend, series_id)
-        _require_confirmation(confirm, "Resuming an Autopilot series")
         body = _optional_params(ends_at=ends_at)
+        current = _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
+        if current.get("status") == "active" and not body:
+            return {"status": "unchanged", "summary": "This series is already running."}
+        approval = _approval({"target": {"id": series_id, "name": current.get("name"), "status": current.get("status")},
+                              "action": "resume", "changes": body,
+                              "side_effects": "Scheduling and publishing will resume; missed times are not made up."},
+                             confirm, preview_token, "resume_series")
+        if approval:
+            return approval
         view = await _first_slot(
             backend, await _api(backend, "POST", f"/api/workflows/{series_id}/resume", body=body or None),
         )
@@ -822,7 +872,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         annotations=WRITE,
         structured_output=True,
     )
-    async def stop_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
+    async def stop_series(series_id: WorkflowId, confirm: Confirm = False, preview_token: PreviewToken = None) -> dict[str, Any]:
         """Use when the user wants a series to end for good but keep its history.
 
         Cancels its queued posts; videos already made and posts already published are kept.
@@ -831,7 +881,14 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: the series with status "stopped" and ``next_step``.
         """
         series_id = await _series_ref(backend, series_id)
-        _require_confirmation(confirm, "Stopping an Autopilot series")
+        current = _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
+        if current.get("status") == "stopped":
+            return {"status": "unchanged", "summary": "This series is already stopped."}
+        approval = _approval({"target": {"id": series_id, "name": current.get("name"), "status": current.get("status")},
+                              "action": "stop", "side_effects": "Queued posts are canceled; published posts and videos remain."},
+                             confirm, preview_token, "stop_series")
+        if approval:
+            return approval
         result = _dict_result(await _api(backend, "POST", f"/api/workflows/{series_id}/stop"))
         held = result.get("canceled_posts")
         return _with_next(
@@ -847,7 +904,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         meta=ASK_EVERY_TIME,
         structured_output=True,
     )
-    async def delete_series(series_id: WorkflowId, confirm: Confirm = False) -> dict[str, Any]:
+    async def delete_series(series_id: WorkflowId, confirm: Confirm = False, preview_token: PreviewToken = None) -> dict[str, Any]:
         """Use when the user wants a series removed entirely. Cannot be undone.
 
         Its schedule is deleted and posts still waiting to go out are cancelled; published
@@ -857,7 +914,13 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Returns: the backend's confirmation and ``next_step``.
         """
         series_id = await _series_ref(backend, series_id)
-        _require_confirmation(confirm, "Deleting an Autopilot series")
+        current = _dict_result(await _api(backend, "GET", f"/api/workflows/{series_id}"))
+        approval = _approval({"target": {"id": series_id, "name": current.get("name"), "status": current.get("status")},
+                              "action": "delete", "reversible": False,
+                              "side_effects": "Schedule and waiting posts are removed; published posts remain."},
+                             confirm, preview_token, "delete_series")
+        if approval:
+            return approval
         return _with_next(
             await _api(backend, "DELETE", f"/api/workflows/{series_id}"),
             "Deleted. It no longer appears in list_series.",
@@ -876,6 +939,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         overrides: Annotated[dict[str, Any] | None, Field(description="Optional generation overrides.")] = None,
         slot_at: Annotated[AwareDatetime | None, Field(description="Replacement timezone-aware posting time.")] = None,
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants to change one upcoming video of a series: its idea, prompt,
         settings or time.
@@ -884,7 +948,6 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Don't: edit a slot that is already generating or posted; only planned slots change.
         Returns: the updated slot.
         """
-        _require_confirmation(confirm, "Updating a series slot")
         body = _optional_params(
             title=_bounded_text(title, "title", 500),
             prompt=_bounded_text(prompt, "prompt", 10_000),
@@ -893,6 +956,17 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         )
         if not body:
             raise _fail("invalid_input", "Provide at least one slot field to update.")
+        current = await _slot_details(backend, str(slot_id))
+        changes = {key: {"from": current.get(key), "to": value} for key, value in body.items()
+                   if current.get(key) != value}
+        if not changes:
+            return {"status": "unchanged", "summary": "This slot already has those settings."}
+        approval = _approval({"target": {"id": str(slot_id), "title": current.get("title"),
+                                         "status": current.get("status"), "slot_at": current.get("slot_at")},
+                              "changes": changes, "side_effects": "Only this upcoming video changes."},
+                             confirm, preview_token, "update_series_slot")
+        if approval:
+            return approval
         slot = _dict_result(await _api(backend, "PATCH", f"/api/workflow-slots/{slot_id}", body=body))
         return _with_next(
             slot,
@@ -910,6 +984,7 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         action: Annotated[Literal["skip", "retry", "regenerate_idea"], Field(description="Slot action to perform.")],
         suggested_changes: Annotated[str | None, Field(max_length=1000, description="Optional guidance for a regenerated idea.")] = None,
         confirm: Confirm = False,
+        preview_token: PreviewToken = None,
     ) -> dict[str, Any]:
         """Use when the user wants to skip one upcoming series video, retry a failed one, or get
         a new idea for it.
@@ -921,7 +996,33 @@ def register(server: MCPServer, backend: BackendClient) -> None:
         Don't: pass suggested_changes for skip or retry; don't retry a slot whose account is broken.
         Returns: the updated slot and ``next_step``.
         """
-        _require_confirmation(confirm, f"Series slot {action}")
+        if action != "regenerate_idea" and suggested_changes is not None:
+            raise _fail("invalid_input", "suggested_changes is only valid for regenerate_idea.")
+        current = await _slot_details(backend, str(slot_id))
+        retry_cost = None
+        if action == "retry":
+            series = _dict_result(await _api(backend, "GET", f"/api/workflows/{current['workflow_id']}"))
+            defaults = {**(series.get("job_defaults") or {}), **(current.get("overrides") or {})}
+            quote = await _priced_defaults(backend, defaults, current.get("prompt") or series.get("theme"))
+            pinned = _pin_defaults(defaults, quote)
+            if any(defaults.get(key) != pinned.get(key) for key in ("format", "resolution")):
+                raise _fail(
+                    "invalid_input",
+                    f"This series would retry with {pinned.get('format')} at {pinned.get('resolution')}, "
+                    "but its saved settings differ. Update the series video settings first; nothing was retried.",
+                )
+            retry_cost = quote.get("estimated_credits")
+            if not isinstance(retry_cost, int | float):
+                raise _fail("service_busy", "Could not price this retry. Nothing was queued or charged; try again later.")
+        approval = _approval({"target": {"id": str(slot_id), "title": current.get("title"),
+                                         "status": current.get("status"), "slot_at": current.get("slot_at")},
+                              "action": action, "guidance": suggested_changes,
+                              "estimated_cost": retry_cost if action == "retry" else 0,
+                              "side_effects": ("A new generation may consume credits." if action == "retry"
+                                               else "Only this scheduled slot changes.")},
+                             confirm, preview_token, "control_series_slot")
+        if approval:
+            return approval
         if action == "regenerate_idea":
             body = _optional_params(suggested_changes=_bounded_text(suggested_changes, "suggested_changes", 1000))
             slot = _dict_result(await _api(backend, "POST", f"/api/workflow-slots/{slot_id}/regenerate-idea", body=body))
